@@ -64,3 +64,5 @@ __pycache__/
 # Ignore Bazel generated files
 bazel-* 
 MODULE.bazel.lock
+
+.venv/

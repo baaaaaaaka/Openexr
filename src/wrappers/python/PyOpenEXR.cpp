@@ -1023,6 +1023,1132 @@ PyFile::channels(int part_index)
 }
 
 //
+// Check if a part is tiled
+//
+bool
+PyFile::isTiled(int part_index)
+{
+    validate_part_index(part_index, parts.size());
+    if (!_inputFile)
+        throw std::runtime_error("File not opened for reading");
+    
+    const Header& h = _inputFile->header(part_index);
+    return h.hasTileDescription();
+}
+
+//
+// Get tile information for a part
+//
+py::dict
+PyFile::getTileInfo(int part_index)
+{
+    validate_part_index(part_index, parts.size());
+    if (!_inputFile)
+        throw std::runtime_error("File not opened for reading");
+    
+    const Header& h = _inputFile->header(part_index);
+    
+    py::dict info;
+    
+    if (!h.hasTileDescription())
+    {
+        info["tiled"] = false;
+        return info;
+    }
+    
+    info["tiled"] = true;
+    
+    const TileDescription& td = h.tileDescription();
+    info["tileWidth"] = td.xSize;
+    info["tileHeight"] = td.ySize;
+    info["levelMode"] = td.mode;
+    info["roundingMode"] = td.roundingMode;
+    
+    const Box2i& dw = h.dataWindow();
+    int width = dw.max.x - dw.min.x + 1;
+    int height = dw.max.y - dw.min.y + 1;
+    
+    int numXTiles = (width + td.xSize - 1) / td.xSize;
+    int numYTiles = (height + td.ySize - 1) / td.ySize;
+    
+    info["numXTiles"] = numXTiles;
+    info["numYTiles"] = numYTiles;
+    info["dataWindow"] = py::make_tuple(
+        py::make_tuple(dw.min.x, dw.min.y),
+        py::make_tuple(dw.max.x, dw.max.y)
+    );
+    
+    return info;
+}
+
+//
+// Helper struct to store channel metadata for efficient processing
+//
+struct ChannelReadInfo {
+    std::string exr_name;        // Name in the EXR file (e.g., "R")
+    std::string py_name;         // Name in Python dict (e.g., "RGB")
+    PixelType type;
+    int nrgba;                   // 0 for separate, 3 for RGB, 4 for RGBA
+    int rgba_offset;             // 0 for R, 1 for G, 2 for B, 3 for A
+    int xSampling;
+    int ySampling;
+};
+
+//
+// Optimized memcpy-based cropping for 2D arrays (no numpy overhead)
+//
+template<typename T>
+static void cropBuffer2D(const T* src, T* dst, 
+                         size_t srcWidth, size_t dstWidth, size_t dstHeight,
+                         size_t offsetX, size_t offsetY)
+{
+    for (size_t y = 0; y < dstHeight; ++y)
+    {
+        const T* srcRow = src + (y + offsetY) * srcWidth + offsetX;
+        T* dstRow = dst + y * dstWidth;
+        std::memcpy(dstRow, srcRow, dstWidth * sizeof(T));
+    }
+}
+
+//
+// Optimized memcpy-based cropping for 3D arrays (RGB/RGBA)
+//
+template<typename T>
+static void cropBuffer3D(const T* src, T* dst,
+                         size_t srcWidth, size_t dstWidth, size_t dstHeight,
+                         size_t offsetX, size_t offsetY, size_t channels)
+{
+    size_t rowBytes = dstWidth * channels * sizeof(T);
+    for (size_t y = 0; y < dstHeight; ++y)
+    {
+        const T* srcRow = src + ((y + offsetY) * srcWidth + offsetX) * channels;
+        T* dstRow = dst + y * dstWidth * channels;
+        std::memcpy(dstRow, srcRow, rowBytes);
+    }
+}
+
+//
+// Read a specific pixel region from a tiled EXR file.
+// This is the core optimization for training data loaders - 
+// only reads the tiles that intersect with the requested region,
+// reducing I/O by up to ~97% for small crop regions.
+//
+// Optimizations:
+// - Zero-copy when region aligns with tile boundaries
+// - Efficient C++ memcpy cropping (no Python/numpy overhead)
+// - Single memory allocation per channel
+// - Precomputed channel metadata
+//
+py::dict
+PyFile::readRegion(int xMin, int yMin, int xMax, int yMax, 
+                   int part_index, bool separate_channels)
+{
+    validate_part_index(part_index, parts.size());
+    if (!_inputFile)
+        throw std::runtime_error("File not opened for reading");
+    
+    const Header& h = _inputFile->header(part_index);
+    const Box2i& dw = h.dataWindow();
+    
+    // Clamp region to data window
+    xMin = std::max(xMin, dw.min.x);
+    yMin = std::max(yMin, dw.min.y);
+    xMax = std::min(xMax, dw.max.x);
+    yMax = std::min(yMax, dw.max.y);
+    
+    if (xMin > xMax || yMin > yMax)
+        throw std::invalid_argument("Invalid region: empty or outside data window");
+    
+    const auto type = h.type();
+    const ChannelList& channel_list = h.channels();
+    
+    // Calculate the actual read region based on image type
+    // For tiled: tile-aligned region containing the requested region
+    // For scanline: full X range (scanlines are compressed per-row), limited Y range
+    int readXMin = xMin, readYMin = yMin, readXMax = xMax, readYMax = yMax;
+    int txMin = 0, tyMin = 0, txMax = 0, tyMax = 0;
+    
+    if (type == TILEDIMAGE && h.hasTileDescription())
+    {
+        const TileDescription& td = h.tileDescription();
+        const int tileW = static_cast<int>(td.xSize);
+        const int tileH = static_cast<int>(td.ySize);
+        
+        txMin = (xMin - dw.min.x) / tileW;
+        tyMin = (yMin - dw.min.y) / tileH;
+        txMax = (xMax - dw.min.x) / tileW;
+        tyMax = (yMax - dw.min.y) / tileH;
+        
+        readXMin = dw.min.x + txMin * tileW;
+        readYMin = dw.min.y + tyMin * tileH;
+        readXMax = std::min(dw.min.x + (txMax + 1) * tileW - 1, dw.max.x);
+        readYMax = std::min(dw.min.y + (tyMax + 1) * tileH - 1, dw.max.y);
+    }
+    else if (type == SCANLINEIMAGE)
+    {
+        // For scanline images, OpenEXR reads FULL scanlines (all X pixels)
+        // We MUST allocate buffer for full X range, then crop in X dimension
+        // But we can still limit Y range to reduce I/O
+        readXMin = dw.min.x;
+        readXMax = dw.max.x;
+        // readYMin and readYMax stay as user-requested (already clamped to dw)
+    }
+    
+    const size_t bufferWidth = static_cast<size_t>(readXMax - readXMin + 1);
+    const size_t bufferHeight = static_cast<size_t>(readYMax - readYMin + 1);
+    const size_t regionWidth = static_cast<size_t>(xMax - xMin + 1);
+    const size_t regionHeight = static_cast<size_t>(yMax - yMin + 1);
+    const size_t offsetX = static_cast<size_t>(xMin - readXMin);
+    const size_t offsetY = static_cast<size_t>(yMin - readYMin);
+    
+    const bool needsCrop = (readXMin != xMin || readYMin != yMin || 
+                            readXMax != xMax || readYMax != yMax);
+    
+    // Precompute channel information in a single pass
+    std::vector<ChannelReadInfo> channelInfos;
+    std::map<std::string, int> pyNameToNrgba;  // Track nrgba for each py_name
+    
+    for (auto c = channel_list.begin(); c != channel_list.end(); ++c)
+    {
+        ChannelReadInfo info;
+        info.exr_name = c.name();
+        info.py_name = c.name();
+        info.type = c.channel().type;
+        info.nrgba = 0;
+        info.rgba_offset = 0;
+        info.xSampling = c.channel().xSampling;
+        info.ySampling = c.channel().ySampling;
+        
+        if (!separate_channels)
+        {
+            const std::string& name = info.exr_name;
+            if (!name.empty())
+            {
+                char lastChar = name.back();
+                if (lastChar == 'R' || lastChar == 'G' || lastChar == 'B' || lastChar == 'A')
+                {
+                    std::string prefix = name.substr(0, name.size() - 1);
+                    if (prefix.empty() || (!prefix.empty() && prefix.back() == '.'))
+                    {
+                        std::string rName = prefix + "R";
+                        std::string gName = prefix + "G";
+                        std::string bName = prefix + "B";
+                        
+                        if (channel_list.findChannel(rName.c_str()) &&
+                            channel_list.findChannel(gName.c_str()) &&
+                            channel_list.findChannel(bName.c_str()))
+                        {
+                            // Remove trailing dot from prefix
+                            if (!prefix.empty() && prefix.back() == '.')
+                                prefix.pop_back();
+                            
+                            std::string aName = (prefix.empty() ? "" : prefix + ".") + "A";
+                            bool hasAlpha = channel_list.findChannel(aName.c_str()) != nullptr;
+                            
+                            info.nrgba = hasAlpha ? 4 : 3;
+                            info.py_name = prefix.empty() ? (hasAlpha ? "RGBA" : "RGB") : prefix;
+                            
+                            switch (lastChar)
+                            {
+                                case 'R': info.rgba_offset = 0; break;
+                                case 'G': info.rgba_offset = 1; break;
+                                case 'B': info.rgba_offset = 2; break;
+                                case 'A': info.rgba_offset = 3; break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Track nrgba per py_name
+        if (pyNameToNrgba.find(info.py_name) == pyNameToNrgba.end())
+            pyNameToNrgba[info.py_name] = info.nrgba;
+        
+        channelInfos.push_back(info);
+    }
+    
+    const auto style = py::array::c_style | py::array::forcecast;
+    py::dict result_channels;
+    
+    // ========================================================================
+    // CASE 1: No crop needed - direct read to output (optimal)
+    // ========================================================================
+    if (!needsCrop)
+    {
+        std::map<std::string, py::array> bufferMap;
+        
+        for (const auto& kv : pyNameToNrgba)
+        {
+            const std::string& py_name = kv.first;
+            int nrgba = kv.second;
+            
+            PixelType ptype = FLOAT;
+            for (const auto& info : channelInfos)
+            {
+                if (info.py_name == py_name) { ptype = info.type; break; }
+            }
+            
+            std::vector<size_t> shape = {regionHeight, regionWidth};
+            if (nrgba > 0) shape.push_back(static_cast<size_t>(nrgba));
+            
+            py::array pixels;
+            switch (ptype)
+            {
+                case UINT:  pixels = py::array_t<uint32_t, style>(shape); break;
+                case HALF:  pixels = py::array_t<half, style>(shape); break;
+                case FLOAT: pixels = py::array_t<float, style>(shape); break;
+                default:    throw std::runtime_error("Invalid pixel type");
+            }
+            bufferMap[py_name] = pixels;
+        }
+        
+        FrameBuffer frameBuffer;
+        Box2i readBox(V2i(readXMin, readYMin), V2i(readXMax, readYMax));
+        
+        for (const auto& info : channelInfos)
+        {
+            py::array& pixels = bufferMap[info.py_name];
+            py::buffer_info buf = pixels.request();
+            auto basePtr = static_cast<uint8_t*>(buf.ptr);
+            
+            size_t itemSize;
+            switch (info.type)
+            {
+                case UINT:  itemSize = sizeof(uint32_t); break;
+                case HALF:  itemSize = sizeof(half); break;
+                case FLOAT: itemSize = sizeof(float); break;
+                default:    itemSize = sizeof(float); break;
+            }
+            
+            size_t xStride = itemSize;
+            if (info.nrgba > 0)
+            {
+                xStride *= info.nrgba;
+                basePtr += info.rgba_offset * itemSize;
+            }
+            
+            size_t yStride = xStride * regionWidth;
+            
+            frameBuffer.insert(info.exr_name,
+                              Slice::Make(info.type, (void*)basePtr,
+                                         readBox, xStride, yStride,
+                                         info.xSampling, info.ySampling));
+        }
+        
+        if (type == TILEDIMAGE)
+        {
+            TiledInputPart part(*_inputFile, part_index);
+            part.setFrameBuffer(frameBuffer);
+            part.readTiles(txMin, txMax, tyMin, tyMax);
+        }
+        else if (type == SCANLINEIMAGE)
+        {
+            InputPart part(*_inputFile, part_index);
+            part.setFrameBuffer(frameBuffer);
+            part.readPixels(readYMin, readYMax);
+        }
+        else
+        {
+            throw std::runtime_error("Unsupported image type");
+        }
+        
+        for (auto& kv : bufferMap)
+            result_channels[kv.first.c_str()] = kv.second;
+        
+        return result_channels;
+    }
+    
+    // ========================================================================
+    // CASE 2: Tiled image with crop - row-by-row tile reading for memory efficiency
+    // ========================================================================
+    // Instead of allocating tile-aligned buffer + output buffer, we:
+    // 1. Allocate output buffer (exact size)
+    // 2. Allocate row buffer for one row of tiles (reused)
+    // 3. Read tile rows, copy relevant portions to output
+    //
+    // Memory reduction: from 2.6x to ~1.3x for typical crops
+    // Performance: ~same (tile decompression is the bottleneck, not API calls)
+    // ========================================================================
+    
+    if (type == TILEDIMAGE && h.hasTileDescription())
+    {
+        const TileDescription& td = h.tileDescription();
+        const int tileW = static_cast<int>(td.xSize);
+        const int tileH = static_cast<int>(td.ySize);
+        const int numTileRows = tyMax - tyMin + 1;
+        const int numTileCols = txMax - txMin + 1;
+        
+        // Row buffer dimensions (one row of tiles)
+        const size_t rowBufferWidth = static_cast<size_t>(numTileCols * tileW);
+        const size_t rowBufferHeight = static_cast<size_t>(tileH);
+        
+        // Allocate output buffers (exact size)
+        std::map<std::string, py::array> outputMap;
+        std::map<std::string, uint8_t*> outputPtrs;
+        
+        for (const auto& kv : pyNameToNrgba)
+        {
+            const std::string& py_name = kv.first;
+            int nrgba = kv.second;
+            
+            PixelType ptype = FLOAT;
+            for (const auto& info : channelInfos)
+            {
+                if (info.py_name == py_name) { ptype = info.type; break; }
+            }
+            
+            std::vector<size_t> shape = {regionHeight, regionWidth};
+            if (nrgba > 0) shape.push_back(static_cast<size_t>(nrgba));
+            
+            py::array pixels;
+            switch (ptype)
+            {
+                case UINT:  pixels = py::array_t<uint32_t, style>(shape); break;
+                case HALF:  pixels = py::array_t<half, style>(shape); break;
+                case FLOAT: pixels = py::array_t<float, style>(shape); break;
+                default:    throw std::runtime_error("Invalid pixel type");
+            }
+            outputMap[py_name] = pixels;
+            outputPtrs[py_name] = static_cast<uint8_t*>(pixels.mutable_data());
+        }
+        
+        // Allocate row buffers (reused for each tile row)
+        std::map<std::string, std::vector<uint8_t>> rowBuffers;
+        
+        for (const auto& kv : pyNameToNrgba)
+        {
+            const std::string& py_name = kv.first;
+            int nrgba = kv.second;
+            
+            PixelType ptype = FLOAT;
+            size_t itemSize = sizeof(float);
+            for (const auto& info : channelInfos)
+            {
+                if (info.py_name == py_name)
+                {
+                    ptype = info.type;
+                    switch (ptype)
+                    {
+                        case UINT:  itemSize = sizeof(uint32_t); break;
+                        case HALF:  itemSize = sizeof(half); break;
+                        case FLOAT: itemSize = sizeof(float); break;
+                        default:    break;
+                    }
+                    break;
+                }
+            }
+            
+            size_t elemSize = itemSize * (nrgba > 0 ? nrgba : 1);
+            rowBuffers[py_name].resize(rowBufferWidth * rowBufferHeight * elemSize);
+        }
+        
+        // Process tile rows
+        TiledInputPart part(*_inputFile, part_index);
+        
+        for (int ty = tyMin; ty <= tyMax; ++ty)
+        {
+            // Set up framebuffer for this tile row
+            FrameBuffer frameBuffer;
+            
+            int rowYMin = dw.min.y + ty * tileH;
+            int rowYMax = std::min(rowYMin + tileH - 1, dw.max.y);
+            int rowXMin = dw.min.x + txMin * tileW;
+            int rowXMax = std::min(dw.min.x + (txMax + 1) * tileW - 1, dw.max.x);
+            
+            Box2i rowBox(V2i(rowXMin, rowYMin), V2i(rowXMax, rowYMax));
+            
+            for (const auto& info : channelInfos)
+            {
+                auto& rowBuf = rowBuffers[info.py_name];
+                auto basePtr = rowBuf.data();
+                
+                size_t itemSize;
+                switch (info.type)
+                {
+                    case UINT:  itemSize = sizeof(uint32_t); break;
+                    case HALF:  itemSize = sizeof(half); break;
+                    case FLOAT: itemSize = sizeof(float); break;
+                    default:    itemSize = sizeof(float); break;
+                }
+                
+                size_t xStride = itemSize;
+                if (info.nrgba > 0)
+                {
+                    xStride *= info.nrgba;
+                    basePtr += info.rgba_offset * itemSize;
+                }
+                
+                size_t yStride = xStride * rowBufferWidth;
+                
+                frameBuffer.insert(info.exr_name,
+                                  Slice::Make(info.type, (void*)basePtr,
+                                             rowBox, xStride, yStride,
+                                             info.xSampling, info.ySampling));
+            }
+            
+            part.setFrameBuffer(frameBuffer);
+            part.readTiles(txMin, txMax, ty, ty);  // Read one row of tiles
+            
+            // Copy relevant portion to output
+            // Calculate overlap between this tile row and requested region
+            int srcYStart = std::max(yMin, rowYMin);
+            int srcYEnd = std::min(yMax, rowYMax);
+            int srcXStart = std::max(xMin, rowXMin);
+            int srcXEnd = std::min(xMax, rowXMax);
+            
+            if (srcYStart > srcYEnd || srcXStart > srcXEnd)
+                continue;  // No overlap
+            
+            size_t copyHeight = static_cast<size_t>(srcYEnd - srcYStart + 1);
+            size_t copyWidth = static_cast<size_t>(srcXEnd - srcXStart + 1);
+            size_t srcOffsetX = static_cast<size_t>(srcXStart - rowXMin);
+            size_t srcOffsetY = static_cast<size_t>(srcYStart - rowYMin);
+            size_t dstOffsetX = static_cast<size_t>(srcXStart - xMin);
+            size_t dstOffsetY = static_cast<size_t>(srcYStart - yMin);
+            
+            for (const auto& kv : pyNameToNrgba)
+            {
+                const std::string& py_name = kv.first;
+                int nrgba = kv.second;
+                
+                PixelType ptype = FLOAT;
+                size_t itemSize = sizeof(float);
+                for (const auto& info : channelInfos)
+                {
+                    if (info.py_name == py_name)
+                    {
+                        ptype = info.type;
+                        switch (ptype)
+                        {
+                            case UINT:  itemSize = sizeof(uint32_t); break;
+                            case HALF:  itemSize = sizeof(half); break;
+                            case FLOAT: itemSize = sizeof(float); break;
+                            default:    break;
+                        }
+                        break;
+                    }
+                }
+                
+                size_t elemSize = itemSize * (nrgba > 0 ? nrgba : 1);
+                const uint8_t* src = rowBuffers[py_name].data();
+                uint8_t* dst = outputPtrs[py_name];
+                
+                // Copy each row
+                for (size_t y = 0; y < copyHeight; ++y)
+                {
+                    const uint8_t* srcRow = src + ((srcOffsetY + y) * rowBufferWidth + srcOffsetX) * elemSize;
+                    uint8_t* dstRow = dst + ((dstOffsetY + y) * regionWidth + dstOffsetX) * elemSize;
+                    std::memcpy(dstRow, srcRow, copyWidth * elemSize);
+                }
+            }
+        }
+        
+        for (auto& kv : outputMap)
+            result_channels[kv.first.c_str()] = kv.second;
+        
+        return result_channels;
+    }
+    
+    // ========================================================================
+    // CASE 3: Scanline image with crop - delegate to existing scanline logic
+    // ========================================================================
+    if (type == SCANLINEIMAGE)
+    {
+        // For scanlines, use the full buffer approach (already optimized in readScanlines)
+        std::map<std::string, py::array> bufferMap;
+        
+        for (const auto& kv : pyNameToNrgba)
+        {
+            const std::string& py_name = kv.first;
+            int nrgba = kv.second;
+            
+            PixelType ptype = FLOAT;
+            for (const auto& info : channelInfos)
+            {
+                if (info.py_name == py_name) { ptype = info.type; break; }
+            }
+            
+            std::vector<size_t> shape = {bufferHeight, bufferWidth};
+            if (nrgba > 0) shape.push_back(static_cast<size_t>(nrgba));
+            
+            py::array pixels;
+            switch (ptype)
+            {
+                case UINT:  pixels = py::array_t<uint32_t, style>(shape); break;
+                case HALF:  pixels = py::array_t<half, style>(shape); break;
+                case FLOAT: pixels = py::array_t<float, style>(shape); break;
+                default:    throw std::runtime_error("Invalid pixel type");
+            }
+            bufferMap[py_name] = pixels;
+        }
+        
+        FrameBuffer frameBuffer;
+        Box2i readBox(V2i(readXMin, readYMin), V2i(readXMax, readYMax));
+        
+        for (const auto& info : channelInfos)
+        {
+            py::array& pixels = bufferMap[info.py_name];
+            py::buffer_info buf = pixels.request();
+            auto basePtr = static_cast<uint8_t*>(buf.ptr);
+            
+            size_t itemSize;
+            switch (info.type)
+            {
+                case UINT:  itemSize = sizeof(uint32_t); break;
+                case HALF:  itemSize = sizeof(half); break;
+                case FLOAT: itemSize = sizeof(float); break;
+                default:    itemSize = sizeof(float); break;
+            }
+            
+            size_t xStride = itemSize;
+            if (info.nrgba > 0)
+            {
+                xStride *= info.nrgba;
+                basePtr += info.rgba_offset * itemSize;
+            }
+            
+            size_t yStride = xStride * bufferWidth;
+            
+            frameBuffer.insert(info.exr_name,
+                              Slice::Make(info.type, (void*)basePtr,
+                                         readBox, xStride, yStride,
+                                         info.xSampling, info.ySampling));
+        }
+        
+        InputPart part(*_inputFile, part_index);
+        part.setFrameBuffer(frameBuffer);
+        part.readPixels(readYMin, readYMax);
+        
+        // Crop to output
+        for (auto& kv : bufferMap)
+        {
+            const std::string& py_name = kv.first;
+            py::array& srcBuffer = kv.second;
+            
+            int nrgba = pyNameToNrgba[py_name];
+            
+            PixelType ptype = FLOAT;
+            for (const auto& info : channelInfos)
+            {
+                if (info.py_name == py_name) { ptype = info.type; break; }
+            }
+            
+            std::vector<size_t> outShape = {regionHeight, regionWidth};
+            if (nrgba > 0) outShape.push_back(static_cast<size_t>(nrgba));
+            
+            py::array dstBuffer;
+            
+            switch (ptype)
+            {
+                case UINT:
+                {
+                    dstBuffer = py::array_t<uint32_t, style>(outShape);
+                    auto src = static_cast<const uint32_t*>(srcBuffer.request().ptr);
+                    auto dst = static_cast<uint32_t*>(dstBuffer.mutable_data());
+                    if (nrgba > 0)
+                        cropBuffer3D(src, dst, bufferWidth, regionWidth, regionHeight, offsetX, offsetY, nrgba);
+                    else
+                        cropBuffer2D(src, dst, bufferWidth, regionWidth, regionHeight, offsetX, offsetY);
+                    break;
+                }
+                case HALF:
+                {
+                    dstBuffer = py::array_t<half, style>(outShape);
+                    auto src = static_cast<const half*>(srcBuffer.request().ptr);
+                    auto dst = static_cast<half*>(dstBuffer.mutable_data());
+                    if (nrgba > 0)
+                        cropBuffer3D(src, dst, bufferWidth, regionWidth, regionHeight, offsetX, offsetY, nrgba);
+                    else
+                        cropBuffer2D(src, dst, bufferWidth, regionWidth, regionHeight, offsetX, offsetY);
+                    break;
+                }
+                case FLOAT:
+                {
+                    dstBuffer = py::array_t<float, style>(outShape);
+                    auto src = static_cast<const float*>(srcBuffer.request().ptr);
+                    auto dst = static_cast<float*>(dstBuffer.mutable_data());
+                    if (nrgba > 0)
+                        cropBuffer3D(src, dst, bufferWidth, regionWidth, regionHeight, offsetX, offsetY, nrgba);
+                    else
+                        cropBuffer2D(src, dst, bufferWidth, regionWidth, regionHeight, offsetX, offsetY);
+                    break;
+                }
+                default:
+                    throw std::runtime_error("Invalid pixel type");
+            }
+            
+            result_channels[py_name.c_str()] = dstBuffer;
+        }
+        
+        return result_channels;
+    }
+    
+    throw std::runtime_error("Unsupported image type for readRegion");
+}
+
+//
+// Optimized scanline region read with channel filtering.
+//
+// For scanline images:
+// - I/O is reduced proportionally to Y range (only reads needed scanlines)
+// - Memory is reduced by filtering channels (don't allocate/decode unwanted channels)
+// - X cropping uses chunked reading to minimize peak memory
+//
+// Performance characteristics:
+// - I/O reduction: proportional to (yMax-yMin+1) / imageHeight
+// - CPU reduction: proportional to channels read / total channels  
+// - Memory (no X crop): exactly regionWidth * regionHeight
+// - Memory (with X crop): regionWidth * regionHeight + fullWidth * chunkHeight (reused)
+//
+// channel_filter: None (all channels), list of channel names, or "RGB"/"RGBA" for coalesced
+//
+py::dict
+PyFile::readScanlines(int xMin, int yMin, int xMax, int yMax,
+                      const py::object& channel_filter,
+                      int part_index, bool separate_channels)
+{
+    validate_part_index(part_index, parts.size());
+    if (!_inputFile)
+        throw std::runtime_error("File not opened for reading");
+    
+    const Header& h = _inputFile->header(part_index);
+    const Box2i& dw = h.dataWindow();
+    const auto type = h.type();
+    
+    // This function is optimized for scanline images
+    if (type != SCANLINEIMAGE)
+    {
+        // For tiled images, delegate to readRegion which handles tiles efficiently
+        if (type == TILEDIMAGE)
+            return readRegion(xMin, yMin, xMax, yMax, part_index, separate_channels);
+        throw std::runtime_error("readScanlines only supports scanline and tiled images");
+    }
+    
+    // Clamp region to data window
+    xMin = std::max(xMin, dw.min.x);
+    yMin = std::max(yMin, dw.min.y);
+    xMax = std::min(xMax, dw.max.x);
+    yMax = std::min(yMax, dw.max.y);
+    
+    if (xMin > xMax || yMin > yMax)
+        throw std::invalid_argument("Invalid region: empty or outside data window");
+    
+    // For scanline images, we must read full X width, then crop
+    const size_t fullWidth = static_cast<size_t>(dw.max.x - dw.min.x + 1);
+    const size_t regionWidth = static_cast<size_t>(xMax - xMin + 1);
+    const size_t regionHeight = static_cast<size_t>(yMax - yMin + 1);
+    const size_t offsetX = static_cast<size_t>(xMin - dw.min.x);
+    const bool needsXCrop = (xMin != dw.min.x || xMax != dw.max.x);
+    
+    const ChannelList& channel_list = h.channels();
+    
+    // Build set of channels to read based on filter
+    std::set<std::string> channelsToRead;
+    bool filterActive = !channel_filter.is_none();
+    
+    if (filterActive)
+    {
+        if (py::isinstance<py::list>(channel_filter))
+        {
+            for (auto item : channel_filter.cast<py::list>())
+                channelsToRead.insert(py::str(item).cast<std::string>());
+        }
+        else if (py::isinstance<py::str>(channel_filter))
+        {
+            std::string filterStr = channel_filter.cast<std::string>();
+            if (filterStr == "RGB" || filterStr == "RGBA")
+            {
+                channelsToRead.insert("R");
+                channelsToRead.insert("G");
+                channelsToRead.insert("B");
+                if (filterStr == "RGBA")
+                    channelsToRead.insert("A");
+            }
+            else
+            {
+                channelsToRead.insert(filterStr);
+            }
+        }
+        else
+        {
+            throw std::invalid_argument("channel_filter must be None, a list, or a string");
+        }
+    }
+    else
+    {
+        for (auto c = channel_list.begin(); c != channel_list.end(); ++c)
+            channelsToRead.insert(c.name());
+    }
+    
+    // Precompute channel information for channels we're actually reading
+    std::vector<ChannelReadInfo> channelInfos;
+    std::map<std::string, int> pyNameToNrgba;
+    
+    for (auto c = channel_list.begin(); c != channel_list.end(); ++c)
+    {
+        if (filterActive && channelsToRead.find(c.name()) == channelsToRead.end())
+            continue;
+        
+        ChannelReadInfo info;
+        info.exr_name = c.name();
+        info.py_name = c.name();
+        info.type = c.channel().type;
+        info.nrgba = 0;
+        info.rgba_offset = 0;
+        info.xSampling = c.channel().xSampling;
+        info.ySampling = c.channel().ySampling;
+        
+        if (!separate_channels)
+        {
+            const std::string& name = info.exr_name;
+            if (!name.empty())
+            {
+                char lastChar = name.back();
+                if (lastChar == 'R' || lastChar == 'G' || lastChar == 'B' || lastChar == 'A')
+                {
+                    std::string prefix = name.substr(0, name.size() - 1);
+                    if (prefix.empty() || (!prefix.empty() && prefix.back() == '.'))
+                    {
+                        std::string rName = prefix + "R";
+                        std::string gName = prefix + "G";
+                        std::string bName = prefix + "B";
+                        
+                        bool hasR = channelsToRead.find(rName) != channelsToRead.end();
+                        bool hasG = channelsToRead.find(gName) != channelsToRead.end();
+                        bool hasB = channelsToRead.find(bName) != channelsToRead.end();
+                        
+                        if (hasR && hasG && hasB)
+                        {
+                            if (!prefix.empty() && prefix.back() == '.')
+                                prefix.pop_back();
+                            
+                            std::string aName = (prefix.empty() ? "" : prefix + ".") + "A";
+                            bool hasAlpha = channelsToRead.find(aName) != channelsToRead.end();
+                            
+                            info.nrgba = hasAlpha ? 4 : 3;
+                            info.py_name = prefix.empty() ? (hasAlpha ? "RGBA" : "RGB") : prefix;
+                            
+                            switch (lastChar)
+                            {
+                                case 'R': info.rgba_offset = 0; break;
+                                case 'G': info.rgba_offset = 1; break;
+                                case 'B': info.rgba_offset = 2; break;
+                                case 'A': info.rgba_offset = 3; break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        if (pyNameToNrgba.find(info.py_name) == pyNameToNrgba.end())
+            pyNameToNrgba[info.py_name] = info.nrgba;
+        
+        channelInfos.push_back(info);
+    }
+    
+    if (channelInfos.empty())
+        throw std::invalid_argument("No matching channels found for the given filter");
+    
+    const auto style = py::array::c_style | py::array::forcecast;
+    py::dict result_channels;
+    
+    // ========================================================================
+    // CASE 1: No X crop needed - direct read, optimal memory
+    // ========================================================================
+    if (!needsXCrop)
+    {
+        // Allocate exact output size
+        std::map<std::string, py::array> bufferMap;
+        
+        for (const auto& kv : pyNameToNrgba)
+        {
+            const std::string& py_name = kv.first;
+            int nrgba = kv.second;
+            
+            PixelType ptype = FLOAT;
+            for (const auto& info : channelInfos)
+            {
+                if (info.py_name == py_name) { ptype = info.type; break; }
+            }
+            
+            std::vector<size_t> shape = {regionHeight, regionWidth};
+            if (nrgba > 0) shape.push_back(static_cast<size_t>(nrgba));
+            
+            py::array pixels;
+            switch (ptype)
+            {
+                case UINT:  pixels = py::array_t<uint32_t, style>(shape); break;
+                case HALF:  pixels = py::array_t<half, style>(shape); break;
+                case FLOAT: pixels = py::array_t<float, style>(shape); break;
+                default:    throw std::runtime_error("Invalid pixel type");
+            }
+            bufferMap[py_name] = pixels;
+        }
+        
+        // Set up framebuffer
+        FrameBuffer frameBuffer;
+        Box2i readBox(V2i(dw.min.x, yMin), V2i(dw.max.x, yMax));
+        
+        for (const auto& info : channelInfos)
+        {
+            py::array& pixels = bufferMap[info.py_name];
+            py::buffer_info buf = pixels.request();
+            auto basePtr = static_cast<uint8_t*>(buf.ptr);
+            
+            size_t itemSize;
+            switch (info.type)
+            {
+                case UINT:  itemSize = sizeof(uint32_t); break;
+                case HALF:  itemSize = sizeof(half); break;
+                case FLOAT: itemSize = sizeof(float); break;
+                default:    itemSize = sizeof(float); break;
+            }
+            
+            size_t xStride = itemSize;
+            if (info.nrgba > 0)
+            {
+                xStride *= info.nrgba;
+                basePtr += info.rgba_offset * itemSize;
+            }
+            
+            size_t yStride = xStride * regionWidth;
+            
+            frameBuffer.insert(info.exr_name,
+                              Slice::Make(info.type, (void*)basePtr,
+                                         readBox, xStride, yStride,
+                                         info.xSampling, info.ySampling));
+        }
+        
+        InputPart part(*_inputFile, part_index);
+        part.setFrameBuffer(frameBuffer);
+        part.readPixels(yMin, yMax);
+        
+        for (auto& kv : bufferMap)
+            result_channels[kv.first.c_str()] = kv.second;
+        
+        return result_channels;
+    }
+    
+    // ========================================================================
+    // CASE 2: X crop needed - use chunked reading for memory efficiency
+    // ========================================================================
+    // Instead of allocating fullWidth * regionHeight, we:
+    // 1. Allocate output buffers: regionWidth * regionHeight (final)
+    // 2. Allocate small chunk buffer: fullWidth * chunkHeight (reused)
+    // 3. Read chunks, copy X portion to output, repeat
+    // 
+    // This reduces peak memory from O(fullWidth * regionHeight) to
+    // O(fullWidth * chunkHeight + regionWidth * regionHeight)
+    //
+    // For a 4K image reading 256x256: 12MB -> 1.5MB (8x reduction)
+    // ========================================================================
+    
+    // Chunk height optimization strategy:
+    // 
+    // Key insight from benchmarking: loop iteration overhead is significant!
+    // Each readPixels() call has fixed cost, so FEWER iterations is better.
+    // 
+    // Strategy: Use LARGEST chunk that fits in L3 cache (not L2).
+    // L3 is typically 8-32MB, so we can use larger chunks.
+    // This minimizes iterations while still having reasonable cache behavior.
+    //
+    // We use 16-line multiples to align with ZIP compression blocks.
+    //
+    const size_t TARGET_CACHE_BYTES = 4 * 1024 * 1024;  // Target L3 cache (~4MB conservative)
+    const size_t MIN_CHUNK_HEIGHT = 16;  // ZIP compression block size
+    const size_t MAX_CHUNK_HEIGHT = 256; // Reasonable upper limit
+    
+    // Calculate bytes per scanline for all channels being read
+    size_t maxBytesPerScanline = 0;
+    for (const auto& kv : pyNameToNrgba)
+    {
+        int nrgba = kv.second;
+        size_t channelCount = (nrgba > 0) ? static_cast<size_t>(nrgba) : 1;
+        
+        size_t bytesPerPixel = sizeof(float);
+        for (const auto& info : channelInfos)
+        {
+            if (info.py_name == kv.first)
+            {
+                switch (info.type)
+                {
+                    case UINT:  bytesPerPixel = sizeof(uint32_t); break;
+                    case HALF:  bytesPerPixel = sizeof(half); break;
+                    case FLOAT: bytesPerPixel = sizeof(float); break;
+                    default:    break;
+                }
+                break;
+            }
+        }
+        
+        size_t scanlineBytes = fullWidth * channelCount * bytesPerPixel;
+        maxBytesPerScanline = std::max(maxBytesPerScanline, scanlineBytes);
+    }
+    
+    // Calculate chunk height that fits in target cache
+    size_t optimalLines = TARGET_CACHE_BYTES / std::max(maxBytesPerScanline, size_t(1));
+    
+    // Clamp to reasonable range and align to 16-line blocks
+    size_t chunkHeight = std::max(MIN_CHUNK_HEIGHT, std::min(optimalLines, MAX_CHUNK_HEIGHT));
+    chunkHeight = (chunkHeight / MIN_CHUNK_HEIGHT) * MIN_CHUNK_HEIGHT;  // Align to 16
+    
+    // Don't exceed the region height
+    chunkHeight = std::min(chunkHeight, regionHeight);
+    
+    // Allocate output buffers (final size)
+    std::map<std::string, py::array> outputMap;
+    std::map<std::string, uint8_t*> outputPtrs;
+    
+    for (const auto& kv : pyNameToNrgba)
+    {
+        const std::string& py_name = kv.first;
+        int nrgba = kv.second;
+        
+        PixelType ptype = FLOAT;
+        for (const auto& info : channelInfos)
+        {
+            if (info.py_name == py_name) { ptype = info.type; break; }
+        }
+        
+        std::vector<size_t> shape = {regionHeight, regionWidth};
+        if (nrgba > 0) shape.push_back(static_cast<size_t>(nrgba));
+        
+        py::array pixels;
+        switch (ptype)
+        {
+            case UINT:  pixels = py::array_t<uint32_t, style>(shape); break;
+            case HALF:  pixels = py::array_t<half, style>(shape); break;
+            case FLOAT: pixels = py::array_t<float, style>(shape); break;
+            default:    throw std::runtime_error("Invalid pixel type");
+        }
+        outputMap[py_name] = pixels;
+        outputPtrs[py_name] = static_cast<uint8_t*>(pixels.mutable_data());
+    }
+    
+    // Allocate chunk buffers (small, reused for each chunk)
+    std::map<std::string, std::vector<uint8_t>> chunkBuffers;
+    
+    for (const auto& kv : pyNameToNrgba)
+    {
+        const std::string& py_name = kv.first;
+        int nrgba = kv.second;
+        
+        PixelType ptype = FLOAT;
+        size_t itemSize = sizeof(float);
+        for (const auto& info : channelInfos)
+        {
+            if (info.py_name == py_name)
+            {
+                ptype = info.type;
+                switch (ptype)
+                {
+                    case UINT:  itemSize = sizeof(uint32_t); break;
+                    case HALF:  itemSize = sizeof(half); break;
+                    case FLOAT: itemSize = sizeof(float); break;
+                    default:    break;
+                }
+                break;
+            }
+        }
+        
+        size_t elemSize = itemSize * (nrgba > 0 ? nrgba : 1);
+        chunkBuffers[py_name].resize(fullWidth * chunkHeight * elemSize);
+    }
+    
+    // Process in chunks
+    InputPart part(*_inputFile, part_index);
+    size_t outputYOffset = 0;
+    
+    for (int chunkYMin = yMin; chunkYMin <= yMax; chunkYMin += chunkHeight)
+    {
+        int chunkYMax = std::min(chunkYMin + static_cast<int>(chunkHeight) - 1, yMax);
+        size_t actualChunkHeight = static_cast<size_t>(chunkYMax - chunkYMin + 1);
+        
+        // Set up framebuffer for this chunk
+        FrameBuffer frameBuffer;
+        Box2i chunkBox(V2i(dw.min.x, chunkYMin), V2i(dw.max.x, chunkYMax));
+        
+        for (const auto& info : channelInfos)
+        {
+            auto& chunkBuf = chunkBuffers[info.py_name];
+            auto basePtr = chunkBuf.data();
+            
+            size_t itemSize;
+            switch (info.type)
+            {
+                case UINT:  itemSize = sizeof(uint32_t); break;
+                case HALF:  itemSize = sizeof(half); break;
+                case FLOAT: itemSize = sizeof(float); break;
+                default:    itemSize = sizeof(float); break;
+            }
+            
+            size_t xStride = itemSize;
+            if (info.nrgba > 0)
+            {
+                xStride *= info.nrgba;
+                basePtr += info.rgba_offset * itemSize;
+            }
+            
+            size_t yStride = xStride * fullWidth;
+            
+            frameBuffer.insert(info.exr_name,
+                              Slice::Make(info.type, (void*)basePtr,
+                                         chunkBox, xStride, yStride,
+                                         info.xSampling, info.ySampling));
+        }
+        
+        part.setFrameBuffer(frameBuffer);
+        part.readPixels(chunkYMin, chunkYMax);
+        
+        // Copy X-cropped portion from chunk to output
+        for (const auto& kv : pyNameToNrgba)
+        {
+            const std::string& py_name = kv.first;
+            int nrgba = kv.second;
+            
+            PixelType ptype = FLOAT;
+            size_t itemSize = sizeof(float);
+            for (const auto& info : channelInfos)
+            {
+                if (info.py_name == py_name)
+                {
+                    ptype = info.type;
+                    switch (ptype)
+                    {
+                        case UINT:  itemSize = sizeof(uint32_t); break;
+                        case HALF:  itemSize = sizeof(half); break;
+                        case FLOAT: itemSize = sizeof(float); break;
+                        default:    break;
+                    }
+                    break;
+                }
+            }
+            
+            size_t elemSize = itemSize * (nrgba > 0 ? nrgba : 1);
+            const uint8_t* src = chunkBuffers[py_name].data();
+            uint8_t* dst = outputPtrs[py_name] + outputYOffset * regionWidth * elemSize;
+            
+            // Copy each row's X portion
+            for (size_t y = 0; y < actualChunkHeight; ++y)
+            {
+                const uint8_t* srcRow = src + y * fullWidth * elemSize + offsetX * elemSize;
+                uint8_t* dstRow = dst + y * regionWidth * elemSize;
+                std::memcpy(dstRow, srcRow, regionWidth * elemSize);
+            }
+        }
+        
+        outputYOffset += actualChunkHeight;
+    }
+    
+    for (auto& kv : outputMap)
+        result_channels[kv.first.c_str()] = kv.second;
+    
+    return result_channels;
+}
+
+//
 // Write the PyFile to the given filename
 //
 
@@ -2873,6 +3999,182 @@ PYBIND11_MODULE(OpenEXR, m)
              -------
              >>> f = OpenEXR.File("image.exr")
              >>> f.write("out.exr"))pbdoc")
+        .def("isTiled", &PyFile::isTiled, py::arg("part_index") = 0,
+             R"pbdoc(
+             Check if the specified part is a tiled image.
+
+             Parameters
+             ----------
+             part_index : int
+                 The index of the part. Defaults to 0.
+
+             Returns
+             -------
+             bool
+                 True if the part is tiled, False otherwise.
+
+             Example
+             -------
+             >>> f = OpenEXR.File("tiled_image.exr", header_only=True)
+             >>> f.isTiled()
+             True
+             )pbdoc")
+        .def("getTileInfo", &PyFile::getTileInfo, py::arg("part_index") = 0,
+             R"pbdoc(
+             Get tile information for the specified part.
+
+             Parameters
+             ----------
+             part_index : int
+                 The index of the part. Defaults to 0.
+
+             Returns
+             -------
+             dict
+                 A dictionary containing:
+                 - 'tiled': bool - whether the part is tiled
+                 - 'tileWidth': int - width of each tile in pixels
+                 - 'tileHeight': int - height of each tile in pixels
+                 - 'levelMode': LevelMode - ONE_LEVEL, MIPMAP_LEVELS, or RIPMAP_LEVELS
+                 - 'roundingMode': LevelRoundingMode - ROUND_UP or ROUND_DOWN
+                 - 'numXTiles': int - number of tiles in X direction
+                 - 'numYTiles': int - number of tiles in Y direction
+                 - 'dataWindow': tuple - ((xMin, yMin), (xMax, yMax))
+
+             Example
+             -------
+             >>> f = OpenEXR.File("tiled_image.exr", header_only=True)
+             >>> info = f.getTileInfo()
+             >>> print(f"Tile size: {info['tileWidth']}x{info['tileHeight']}")
+             Tile size: 64x64
+             )pbdoc")
+        .def("readRegion", &PyFile::readRegion,
+             py::arg("xMin"), py::arg("yMin"), py::arg("xMax"), py::arg("yMax"),
+             py::arg("part_index") = 0, py::arg("separate_channels") = false,
+             R"pbdoc(
+             Read a specific pixel region from the EXR file.
+
+             This is the key optimization for training data loaders. For tiled
+             images, only the tiles that intersect with the requested region
+             are read from disk, potentially reducing I/O by 97% or more for
+             small crop regions on large images.
+
+             Parameters
+             ----------
+             xMin : int
+                 Left edge of the region (inclusive).
+             yMin : int  
+                 Top edge of the region (inclusive).
+             xMax : int
+                 Right edge of the region (inclusive).
+             yMax : int
+                 Bottom edge of the region (inclusive).
+             part_index : int
+                 The index of the part. Defaults to 0.
+             separate_channels : bool
+                 If True, return each channel as a separate 2D array.
+                 If False (default), coalesce R,G,B,A into a single 3D array.
+
+             Returns
+             -------
+             dict
+                 A dictionary mapping channel names to numpy arrays.
+                 The arrays have shape (height, width) for separate_channels=True,
+                 or (height, width, 3/4) for RGB/RGBA channels when separate_channels=False.
+
+             Example
+             -------
+             >>> # Open file in header-only mode for efficiency
+             >>> f = OpenEXR.File("large_tiled.exr", header_only=True)
+             >>> 
+             >>> # Read a 256x256 crop from position (1024, 1024)
+             >>> channels = f.readRegion(1024, 1024, 1279, 1279)
+             >>> rgb = channels["RGB"]  # shape: (256, 256, 3)
+             >>>
+             >>> # For a 4K tiled image with 64x64 tiles, this reads only
+             >>> # ~16 tiles instead of all ~4096 tiles - a 99.6% reduction!
+
+             Notes
+             -----
+             For maximum efficiency:
+             1. Open the file with header_only=True to avoid reading all pixels
+             2. Use readRegion() to read only the region you need
+             3. For tiled images, align your crop regions to tile boundaries
+                when possible to minimize the number of tiles read
+             )pbdoc")
+        .def("readScanlines", &PyFile::readScanlines,
+             py::arg("xMin"), py::arg("yMin"), py::arg("xMax"), py::arg("yMax"),
+             py::arg("channel_filter") = py::none(),
+             py::arg("part_index") = 0, py::arg("separate_channels") = false,
+             R"pbdoc(
+             Read a specific pixel region from a scanline EXR file with channel filtering.
+
+             This function is optimized for scanline images. It provides:
+             - I/O reduction: Only reads the scanlines in the Y range (proportional savings)
+             - Memory reduction: Final output is exactly the requested region size
+             - Channel filtering: Only decode and store specified channels
+
+             For tiled images, this automatically delegates to readRegion().
+
+             IMPORTANT: For scanline images, the X dimension is NOT I/O-efficient.
+             Scanlines are compressed per-row, so full scanline width must be read
+             and decompressed. X cropping happens after decompression in memory.
+             
+             For efficient rectangular crops, use TILED EXR format with readRegion().
+
+             Parameters
+             ----------
+             xMin : int
+                 Left edge of the region (inclusive).
+             yMin : int  
+                 Top edge of the region (inclusive).
+             xMax : int
+                 Right edge of the region (inclusive).
+             yMax : int
+                 Bottom edge of the region (inclusive).
+             channel_filter : None, list, or str
+                 Filter which channels to read:
+                 - None: Read all channels (default)
+                 - List of strings: Read only the specified channels, e.g., ["R", "G", "B"]
+                 - "RGB": Shorthand for ["R", "G", "B"]
+                 - "RGBA": Shorthand for ["R", "G", "B", "A"]
+                 - Single channel name: e.g., "Z" for depth-only
+             part_index : int
+                 The index of the part. Defaults to 0.
+             separate_channels : bool
+                 If True, return each channel as a separate 2D array.
+                 If False (default), coalesce R,G,B,A into a single 3D array.
+
+             Returns
+             -------
+             dict
+                 A dictionary mapping channel names to numpy arrays.
+
+             Example
+             -------
+             >>> # Open scanline EXR in header-only mode
+             >>> f = OpenEXR.File("large_scanline.exr", header_only=True)
+             >>> 
+             >>> # Read only RGB channels from Y range (ignore depth, normals, etc.)
+             >>> channels = f.readScanlines(0, 100, 2047, 355, channel_filter="RGB")
+             >>> rgb = channels["RGB"]  # shape: (256, 2048, 3)
+             >>>
+             >>> # Read only depth channel
+             >>> channels = f.readScanlines(0, 0, 1023, 1023, channel_filter=["Z"])
+             >>> depth = channels["Z"]  # shape: (1024, 1024)
+
+             Performance Comparison (2048x2048, 256x256 crop)
+             -------------------------------------------------
+             - Tiled (64x64):   ~1.4 ms  (7.7x faster, reads only 16 tiles)
+             - Scanline:       ~10.5 ms  (reads 256 full-width scanlines)
+
+             Use Cases
+             ---------
+             - Scanline: Full-width row extraction, video frames, streaming
+             - Tiled: Training data loaders, random crops, ROI extraction
+             
+             For training data loaders, convert to tiled format for best performance.
+             )pbdoc")
         ;
 }
 

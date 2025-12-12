@@ -46,6 +46,55 @@ set(OPENEXR_VERSION_API "${OpenEXR_VERSION_MAJOR}_${OpenEXR_VERSION_MINOR}")
 set(OPENEXR_LIB_SOVERSION 33)
 set(OPENEXR_LIB_VERSION "${OPENEXR_LIB_SOVERSION}.${OPENEXR_VERSION}") # e.g. "31.3.2.0"
 
+#######################################
+# Target CPU Architecture Configuration
+#######################################
+#
+# The oldest platform we need to support is NVIDIA DGX-1, which uses
+# Intel Xeon E5-2698 v4 processors (Broadwell microarchitecture, released 2016).
+#
+# Broadwell supports: SSE4.2, AVX, AVX2, FMA, BMI1, BMI2
+# Broadwell does NOT support: AVX-512 (introduced in Skylake-SP/Skylake-X)
+#
+# To ensure the compiled binaries run correctly on DGX-1 and all newer x86_64
+# systems, we target the Broadwell architecture. This enables optimal use of
+# AVX2 vectorization while excluding AVX-512 instructions that would cause
+# illegal instruction errors on older hardware.
+#
+# The -mtune=generic flag ensures the instruction scheduling is balanced
+# across different CPU models for good overall performance.
+#
+# Reference:
+#   - DGX-1 specs: https://images.nvidia.com/content/technologies/deep-learning/pdf/dgx-1-rhel-datasheet-nvidia-us-702688-r3-web.pdf
+#   - Intel Xeon E5 v4 family: Broadwell-EP microarchitecture
+#   - x86-64 psABI levels: x86-64-v3 corresponds to AVX2 baseline
+#
+option(OPENEXR_USE_BROADWELL_BASELINE "Target Broadwell (AVX2) as minimum CPU architecture for x86_64 builds" ON)
+
+if(OPENEXR_USE_BROADWELL_BASELINE)
+  # Only apply to x86_64 architecture, not ARM or other platforms
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+    # Check for GCC or Clang
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+      set(OPENEXR_ARCH_FLAGS "-march=broadwell -mtune=generic")
+      
+      # Append to existing flags, don't overwrite user-specified flags
+      set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OPENEXR_ARCH_FLAGS}")
+      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OPENEXR_ARCH_FLAGS}")
+      
+      message(STATUS "Targeting Broadwell architecture (AVX2, no AVX-512) for DGX-1 compatibility")
+    elseif(MSVC)
+      # MSVC uses /arch:AVX2 for AVX2 support (no finer-grained control)
+      set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /arch:AVX2")
+      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /arch:AVX2")
+      
+      message(STATUS "Targeting AVX2 architecture for DGX-1 compatibility (MSVC)")
+    endif()
+  else()
+    message(STATUS "Non-x86_64 architecture detected (${CMAKE_SYSTEM_PROCESSOR}), skipping Broadwell targeting")
+  endif()
+endif()
+
 if(OPENEXR_INSTALL OR OPENEXR_INSTALL_TOOLS OR OPENEXR_INSTALL_DEVELOPER_TOOLS)
   # uninstall target
   if(NOT TARGET uninstall)

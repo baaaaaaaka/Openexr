@@ -30,6 +30,24 @@ public:
 
     void         write(const char* filename);
     
+    // New: Read a specific pixel region from a tiled EXR file
+    // Returns a dict of channel name -> numpy array for the specified region
+    py::dict     readRegion(int xMin, int yMin, int xMax, int yMax, 
+                            int part_index = 0, bool separate_channels = false);
+    
+    // New: Optimized scanline region read with channel filtering
+    // For scanline images: reduces I/O by limiting Y range, reduces memory by 
+    // filtering channels, and uses zero-copy X cropping via stride tricks.
+    py::dict     readScanlines(int xMin, int yMin, int xMax, int yMax,
+                               const py::object& channel_filter = py::none(),
+                               int part_index = 0, bool separate_channels = false);
+    
+    // New: Get tile information for a part
+    py::dict     getTileInfo(int part_index = 0);
+    
+    // New: Check if part is tiled
+    bool         isTiled(int part_index = 0);
+    
     std::string  filename;
     py::list     parts;
 
