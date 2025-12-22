@@ -32,6 +32,7 @@
 #include <ImfDeepFrameBuffer.h>
 #include <ImfPartType.h>
 #include <ImfArray.h>
+#include <ImfThreading.h>
 
 #include <ImfBoxAttribute.h>
 #include <ImfBytesAttribute.h>
@@ -3436,6 +3437,38 @@ PYBIND11_MODULE(OpenEXR, m)
     
     m.attr("__version__") = OPENEXR_VERSION_STRING;
     m.attr("OPENEXR_VERSION") = OPENEXR_VERSION_STRING;
+
+    //
+    // Threading functions
+    //
+    
+    m.def("setGlobalThreadCount", &Imf::setGlobalThreadCount,
+          py::arg("count"),
+          R"doc(
+Set the number of threads used for parallel decompression.
+
+By default, OpenEXR uses 0 threads (single-threaded mode).
+Call this function at the start of your program to enable
+multi-threaded tile/scanline decompression.
+
+Example:
+    import OpenEXR
+    import os
+    OpenEXR.setGlobalThreadCount(os.cpu_count())  # Use all CPU cores
+    # or
+    OpenEXR.setGlobalThreadCount(2)  # Use 2 threads
+
+Args:
+    count: Number of threads to use. 0 = single-threaded mode.
+)doc");
+
+    m.def("globalThreadCount", &Imf::globalThreadCount,
+          R"doc(
+Get the current number of threads used for parallel decompression.
+
+Returns:
+    int: The current global thread count (0 = single-threaded).
+)doc");
 
     //
     // Add symbols from the legacy implementation of the bindings for
