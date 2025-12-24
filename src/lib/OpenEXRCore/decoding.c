@@ -9,6 +9,7 @@
 
 #include "internal_coding.h"
 #include "internal_decompress.h"
+#include "internal_memory.h"
 #include "internal_structs.h"
 #include "internal_xdr.h"
 
@@ -137,6 +138,122 @@ read_uncompressed_direct (exr_decode_pipeline_t* decode)
                 priv_to_native16 (cdata, decc->width);
             else
                 priv_to_native32 (cdata, decc->width);
+        }
+    }
+
+    return EXR_ERR_SUCCESS;
+}
+
+/*
+ * Fast path for uncompressed HALF data read directly to FLOAT output.
+ * Reads all scanline data in a single I/O operation, then converts to FLOAT.
+ * This minimizes system calls compared to per-line reading.
+ */
+static exr_result_t
+read_uncompressed_half_to_float (exr_decode_pipeline_t* decode)
+{
+    exr_result_t        rv;
+    int                 height, start_y;
+    uint64_t            dataoffset, total_bytes;
+    exr_const_context_t ctxt = decode->context;
+    uint8_t*            read_buffer = NULL;
+    uint16_t*           line_buffer = NULL;
+    size_t              bytes_per_scanline = 0;
+    size_t              max_line_width = 0;
+
+    if (!ctxt) return EXR_ERR_MISSING_CONTEXT_ARG;
+    if (ctxt->mode != EXR_CONTEXT_READ)
+        return ctxt->standard_error (ctxt, EXR_ERR_NOT_OPEN_READ);
+    if (decode->part_index < 0 || decode->part_index >= ctxt->num_parts)
+        return ctxt->print_error (
+            ctxt,
+            EXR_ERR_ARGUMENT_OUT_OF_RANGE,
+            "Part index (%d) out of range",
+            decode->part_index);
+
+    height  = decode->chunk.height;
+    start_y = decode->chunk.start_y;
+
+    /* Calculate bytes per scanline (all channels) and max line width */
+    for (int c = 0; c < decode->channel_count; ++c)
+    {
+        exr_coding_channel_info_t* decc = (decode->channels + c);
+        if (decc->height > 0) {
+            bytes_per_scanline += (size_t) decc->width * sizeof(uint16_t);
+            if ((size_t) decc->width > max_line_width)
+                max_line_width = (size_t) decc->width;
+        }
+    }
+
+    /* Total bytes to read for the entire chunk */
+    total_bytes = bytes_per_scanline * (uint64_t) height;
+
+    /* Allocate buffer for entire chunk (single I/O read) */
+    rv = internal_decode_alloc_buffer (
+        decode,
+        EXR_TRANSCODE_BUFFER_SCRATCH1,
+        (void**) &read_buffer,
+        &decode->scratch_alloc_size_1,
+        total_bytes);
+    if (rv != EXR_ERR_SUCCESS) return rv;
+
+    /* Allocate line buffer for endian conversion (thread-safe) */
+    rv = internal_decode_alloc_buffer (
+        decode,
+        EXR_TRANSCODE_BUFFER_SCRATCH2,
+        (void**) &line_buffer,
+        &decode->scratch_alloc_size_2,
+        max_line_width * sizeof(uint16_t));
+    if (rv != EXR_ERR_SUCCESS) return rv;
+
+    /* Read entire chunk in one I/O operation */
+    dataoffset = decode->chunk.data_offset;
+    rv = ctxt->do_read (
+        ctxt, read_buffer, total_bytes, &dataoffset, NULL, EXR_MUST_READ_ALL);
+    if (rv != EXR_ERR_SUCCESS) return rv;
+
+    /* Now convert each line from the buffer to output */
+    const uint8_t* src = read_buffer;
+    
+    for (int y = 0; y < height; ++y)
+    {
+        for (int c = 0; c < decode->channel_count; ++c)
+        {
+            exr_coding_channel_info_t* decc = (decode->channels + c);
+            uint8_t* outptr;
+            size_t width_bytes;
+
+            if (decc->height == 0) continue;
+
+            width_bytes = (size_t) decc->width * sizeof(uint16_t);
+
+            if (decc->y_samples > 1 && ((start_y + y) % decc->y_samples) != 0)
+            {
+                /* Skip this line in output but still advance source */
+                src += width_bytes;
+                continue;
+            }
+
+            /* Calculate output pointer */
+            outptr = decc->decode_to_ptr;
+            if (decc->y_samples > 1)
+            {
+                outptr += ((uint64_t) (y / decc->y_samples) *
+                           (uint64_t) decc->user_line_stride);
+            }
+            else
+            {
+                outptr += (uint64_t) y * (uint64_t) decc->user_line_stride;
+            }
+
+            /* Copy to line buffer and convert to native endian */
+            memcpy(line_buffer, src, width_bytes);
+            priv_to_native16 (line_buffer, decc->width);
+            
+            /* Convert HALF to FLOAT and write to output */
+            internal_half_to_float_buffer ((float*) outptr, line_buffer, decc->width);
+            
+            src += width_bytes;
         }
     }
 
@@ -472,6 +589,24 @@ exr_decoding_choose_default_routines (
         decode->unpack_and_convert_fn = NULL;
         return EXR_ERR_SUCCESS;
     }
+
+    /* special case: uncompressed HALF -> FLOAT conversion
+     * Read HALF data line by line and convert directly to FLOAT output,
+     * avoiding the full unpacked buffer allocation */
+    if (!isdeep && part->comp_type == EXR_COMPRESSION_NONE &&
+        chanstounpack == 0 && chanstofill > 0 &&
+        chanstofill == decode->channel_count &&
+        sametype == EXR_PIXEL_HALF &&    /* all input channels are HALF */
+        sameouttype == EXR_PIXEL_FLOAT && /* all output channels are FLOAT */
+        sameoutinc == 4 &&               /* output is planar FLOAT */
+        !hassampling)                    /* no subsampling */
+    {
+        decode->read_fn               = &read_uncompressed_half_to_float;
+        decode->decompress_fn         = NULL;
+        decode->unpack_and_convert_fn = NULL;
+        return EXR_ERR_SUCCESS;
+    }
+
     decode->read_fn = &default_read_chunk;
     if (part->comp_type != EXR_COMPRESSION_NONE)
         decode->decompress_fn = &exr_uncompress_chunk;

@@ -297,6 +297,13 @@ uint_to_float_int (uint32_t ui)
     return v.i;
 }
 
+/*
+ * Convert a buffer of half-precision values to float.
+ * Uses SIMD when available for optimal performance.
+ * Defined in unpack.c
+ */
+void internal_half_to_float_buffer (float* out, const uint16_t* in, int count);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

@@ -14,6 +14,9 @@
 
 /**************************************/
 
+/* Cache line alignment for better memory performance */
+#define EXR_CACHE_LINE_SIZE 64
+
 static exr_memory_allocation_func_t _glob_alloc_func = NULL;
 static exr_memory_free_func_t       _glob_free_func  = NULL;
 
@@ -38,6 +41,49 @@ internal_exr_alloc (size_t bytes)
 #else
     return malloc (bytes);
 #endif
+}
+
+/**************************************/
+
+/*
+ * Allocate memory aligned to cache line (64 bytes) for better performance.
+ * The returned pointer can be freed with standard free().
+ */
+void*
+internal_exr_alloc_cacheline (size_t bytes)
+{
+    void* ptr = NULL;
+    if (_glob_alloc_func) return (*_glob_alloc_func) (bytes);
+#ifdef _WIN32
+    ptr = _aligned_malloc (bytes, EXR_CACHE_LINE_SIZE);
+#elif defined(__APPLE__) || (defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L)
+    if (posix_memalign (&ptr, EXR_CACHE_LINE_SIZE, bytes) != 0)
+        ptr = NULL;
+#elif __STDC_VERSION__ >= 201112L
+    ptr = aligned_alloc (EXR_CACHE_LINE_SIZE, 
+                         (bytes + EXR_CACHE_LINE_SIZE - 1) & ~(EXR_CACHE_LINE_SIZE - 1));
+#else
+    ptr = malloc (bytes);
+#endif
+    return ptr;
+}
+
+/**************************************/
+
+void
+internal_exr_free_cacheline (void* ptr)
+{
+    if (!ptr) return;
+
+    if (_glob_free_func) { (*_glob_free_func) (ptr); }
+    else
+    {
+#ifdef _WIN32
+        _aligned_free (ptr);
+#else
+        free (ptr);
+#endif
+    }
 }
 
 /**************************************/

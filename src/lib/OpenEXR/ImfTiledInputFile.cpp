@@ -26,10 +26,195 @@
 #include "ImfTileOffsets.h"
 #include "ImfTiledMisc.h"
 
+#include "openexr_decode.h"
+
+// Global flag to enable non-temporal writes for tile decoding.
+// This is useful for ML data loaders where decoded data is immediately
+// transferred to GPU memory and won't be read again soon.
+// Thread-safe: uses atomic for thread safety.
+#include <atomic>
+static std::atomic<bool> g_useNonTemporalWrites{false};
+
+// Thread-local storage for X-direction cropping during tile decode.
+// This allows the decoder to skip unnecessary pixels, reducing memory bandwidth.
+struct XCropConfig {
+    int cropXMin = -1;  // -1 means no crop (full tile)
+    int cropXMax = -1;
+    int tileWidth = 0;  // Full tile width
+};
+static thread_local XCropConfig g_xCropConfig;
+
+// Thread-local storage for Y-direction cropping during tile decode.
+// This allows the decoder to skip unnecessary lines, reducing memory bandwidth.
+struct YCropConfig {
+    int cropYMin = -1;  // -1 means no crop (full tile)
+    int cropYMax = -1;
+};
+static thread_local YCropConfig g_yCropConfig;
+
+namespace OPENEXR_IMF_INTERNAL_NAMESPACE {
+    
+IMF_EXPORT void setNonTemporalWrites(bool enable)
+{
+    g_useNonTemporalWrites.store(enable, std::memory_order_relaxed);
+}
+
+IMF_EXPORT bool nonTemporalWrites()
+{
+    return g_useNonTemporalWrites.load(std::memory_order_relaxed);
+}
+
+// Set X crop region for tile decoding (thread-local)
+// cropXMin/cropXMax are absolute pixel coordinates
+// tileWidth is the full tile width
+IMF_EXPORT void setTileXCrop(int cropXMin, int cropXMax, int tileWidth)
+{
+    g_xCropConfig.cropXMin = cropXMin;
+    g_xCropConfig.cropXMax = cropXMax;
+    g_xCropConfig.tileWidth = tileWidth;
+}
+
+// Clear X crop (use full tile)
+IMF_EXPORT void clearTileXCrop()
+{
+    g_xCropConfig.cropXMin = -1;
+    g_xCropConfig.cropXMax = -1;
+    g_xCropConfig.tileWidth = 0;
+}
+
+// Set Y crop region for tile decoding (thread-local)
+// cropYMin/cropYMax are absolute pixel coordinates
+IMF_EXPORT void setTileYCrop(int cropYMin, int cropYMax)
+{
+    g_yCropConfig.cropYMin = cropYMin;
+    g_yCropConfig.cropYMax = cropYMax;
+}
+
+// Clear Y crop (use full tile)
+IMF_EXPORT void clearTileYCrop()
+{
+    g_yCropConfig.cropYMin = -1;
+    g_yCropConfig.cropYMax = -1;
+}
+
+} // namespace OPENEXR_IMF_INTERNAL_NAMESPACE
+
 #include <algorithm>
 #include <vector>
+#include <unordered_map>
+#include <cstring>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#else
+#include <windows.h>
+#endif
+
+// I/O Merging support for Lustre/GPFS optimization
+// When enabled, multiple tile reads are merged into fewer large I/O operations
+// This variable is also referenced by ImfScanLineInputFile.cpp
+std::atomic<bool> g_enableIOMerge{false};
+
+// Thread-local prefetch buffer and mapping for merged I/O
+struct PrefetchBuffer {
+    std::vector<uint8_t> data;
+    // Map from chunk data_offset to position in prefetch buffer
+    std::unordered_map<uint64_t, std::pair<size_t, size_t>> offsetMap;  // offset -> (buffer_pos, size)
+    bool active = false;
+};
+static thread_local PrefetchBuffer g_prefetchBuffer;
+
+// Custom read function that uses prefetched data - zero-copy version
+static exr_result_t
+prefetched_read_chunk(exr_decode_pipeline_t* decode)
+{
+    if (!g_prefetchBuffer.active) {
+        return EXR_ERR_INVALID_ARGUMENT;
+    }
+    
+    uint64_t dataOffset = decode->chunk.data_offset;
+    auto it = g_prefetchBuffer.offsetMap.find(dataOffset);
+    if (it == g_prefetchBuffer.offsetMap.end()) {
+        return EXR_ERR_INVALID_ARGUMENT;
+    }
+    
+    size_t bufferPos = it->second.first;
+    
+    // Zero-copy: point directly to prefetch buffer
+    // The packed_buffer is only read by the decompressor, not modified
+    // We mark alloc_size as 0 to prevent the decoder from freeing it
+    if (decode->packed_buffer && decode->packed_alloc_size > 0 && decode->free_fn) {
+        // Free any previously allocated buffer
+        decode->free_fn(EXR_TRANSCODE_BUFFER_PACKED, decode->packed_buffer);
+    }
+    
+    decode->packed_buffer = g_prefetchBuffer.data.data() + bufferPos;
+    decode->packed_alloc_size = 0;  // Mark as not owned - prevents free
+    
+    return EXR_ERR_SUCCESS;
+}
+
+// Helper: read multiple ranges from file using a single open
+static bool 
+readMultipleRangesFromFile(const char* filename, 
+                           const std::vector<std::pair<uint64_t, uint64_t>>& ranges,
+                           uint8_t* buffer)
+{
+#ifndef _WIN32
+    int fd = open(filename, O_RDONLY);
+    if (fd < 0) return false;
+    
+    size_t bufferPos = 0;
+    for (const auto& r : ranges) {
+        ssize_t bytesRead = pread(fd, buffer + bufferPos, r.second, static_cast<off_t>(r.first));
+        if (bytesRead != static_cast<ssize_t>(r.second)) {
+            close(fd);
+            return false;
+        }
+        bufferPos += r.second;
+    }
+    
+    close(fd);
+    return true;
+#else
+    HANDLE hFile = CreateFileA(filename, GENERIC_READ, FILE_SHARE_READ, 
+                               NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+    
+    size_t bufferPos = 0;
+    for (const auto& r : ranges) {
+        OVERLAPPED overlapped = {};
+        overlapped.Offset = static_cast<DWORD>(r.first);
+        overlapped.OffsetHigh = static_cast<DWORD>(r.first >> 32);
+        
+        DWORD bytesRead = 0;
+        BOOL success = ReadFile(hFile, buffer + bufferPos, static_cast<DWORD>(r.second), &bytesRead, &overlapped);
+        if (!success || bytesRead != r.second) {
+            CloseHandle(hFile);
+            return false;
+        }
+        bufferPos += r.second;
+    }
+    
+    CloseHandle(hFile);
+    return true;
+#endif
+}
 
 OPENEXR_IMF_INTERNAL_NAMESPACE_SOURCE_ENTER
+
+// Enable/disable I/O merging for tile reading
+IMF_EXPORT void setIOMerge(bool enable)
+{
+    g_enableIOMerge.store(enable, std::memory_order_relaxed);
+}
+
+IMF_EXPORT bool isMergeEnabled()
+{
+    return g_enableIOMerge.load(std::memory_order_relaxed);
+}
 
 namespace {
 
@@ -758,24 +943,192 @@ TiledInputFile::tileOrder (int dx[], int dy[], int lx[], int ly[]) const
     }
 }
 
+// Helper: merge adjacent byte ranges for I/O optimization
+static std::vector<std::pair<uint64_t, uint64_t>> 
+mergeIOranges(std::vector<std::pair<uint64_t, uint64_t>>& ranges, uint64_t gapThreshold = 4096)
+{
+    if (ranges.empty()) return {};
+    
+    // Sort by offset
+    std::sort(ranges.begin(), ranges.end());
+    
+    std::vector<std::pair<uint64_t, uint64_t>> merged;
+    merged.push_back(ranges[0]);
+    
+    for (size_t i = 1; i < ranges.size(); ++i) {
+        auto& last = merged.back();
+        const auto& curr = ranges[i];
+        
+        uint64_t lastEnd = last.first + last.second;
+        
+        // Merge if overlapping or gap is small
+        if (curr.first <= lastEnd + gapThreshold) {
+            uint64_t newEnd = std::max(lastEnd, curr.first + curr.second);
+            last.second = newEnd - last.first;
+        } else {
+            merged.push_back(curr);
+        }
+    }
+    
+    return merged;
+}
+
 void TiledInputFile::Data::readTiles (int dx1, int dx2, int dy1, int dy2, int lx, int ly)
 {
     int nTiles = dx2 - dx1 + 1;
     nTiles *= dy2 - dy1 + 1;
 
     exr_chunk_info_t      cinfo;
+    
+    // ==================== I/O MERGING OPTIMIZATION ====================
+    // If I/O merging is enabled and we have multiple tiles, prefetch all data
+    // in merged I/O operations to reduce the number of system calls.
+    // Also collect chunk info once to avoid redundant queries.
+    bool usePrefetch = g_enableIOMerge.load(std::memory_order_relaxed) && nTiles > 1;
+    std::vector<exr_chunk_info_t> allChunks;  // Reused if prefetch enabled
+    
+    if (usePrefetch)
+    {
+        // Phase 1: Collect all chunk info (will be reused in decode loop)
+        allChunks.reserve(nTiles);
+        std::vector<std::pair<uint64_t, uint64_t>> ioRanges;
+        ioRanges.reserve(nTiles);
+        
+        for (int ty = dy1; ty <= dy2; ++ty)
+        {
+            for (int tx = dx1; tx <= dx2; ++tx)
+            {
+                exr_result_t rv = exr_read_tile_chunk_info (
+                    *_ctxt, partNumber, tx, ty, lx, ly, &cinfo);
+                if (EXR_ERR_INCOMPLETE_CHUNK_TABLE == rv)
+                {
+                    THROW (
+                        IEX_NAMESPACE::InputExc,
+                        "Tile (" << tx << ", " << ty << ", " << lx << ", " << ly
+                        << ") is missing.");
+                }
+                else if (EXR_ERR_SUCCESS != rv)
+                    throw IEX_NAMESPACE::InputExc ("Unable to query tile information");
+                
+                allChunks.push_back(cinfo);
+                ioRanges.push_back({cinfo.data_offset, cinfo.packed_size});
+            }
+        }
+        
+        // Phase 2: Merge adjacent ranges and calculate total size
+        auto mergedRanges = mergeIOranges(ioRanges, 4096);
+        
+        size_t totalSize = 0;
+        for (const auto& r : mergedRanges) {
+            totalSize += r.second;
+        }
+        
+        g_prefetchBuffer.data.resize(totalSize);
+        g_prefetchBuffer.offsetMap.clear();
+        g_prefetchBuffer.offsetMap.reserve(nTiles);
+        
+        // Phase 3: Read merged ranges (single file open)
+        const char* filename = _ctxt->fileName();
+        if (!filename || filename[0] == '\0') {
+            usePrefetch = false;
+            allChunks.clear();  // Will need to re-query
+        }
+        else
+        {
+            if (!readMultipleRangesFromFile(filename, mergedRanges, g_prefetchBuffer.data.data())) {
+                throw IEX_NAMESPACE::IoExc ("Failed to prefetch tile data");
+            }
+            
+            // Build offset map with single pass
+            std::vector<std::pair<uint64_t, size_t>> rangeStartToBufferPos;
+            rangeStartToBufferPos.reserve(mergedRanges.size());
+            size_t bufferPos = 0;
+            for (const auto& r : mergedRanges) {
+                rangeStartToBufferPos.push_back({r.first, bufferPos});
+                bufferPos += r.second;
+            }
+            
+            for (const auto& chunk : allChunks) {
+                auto it = std::upper_bound(rangeStartToBufferPos.begin(), rangeStartToBufferPos.end(),
+                                          std::make_pair(chunk.data_offset, SIZE_MAX));
+                if (it != rangeStartToBufferPos.begin()) {
+                    --it;
+                    g_prefetchBuffer.offsetMap[chunk.data_offset] = {
+                        it->second + (chunk.data_offset - it->first), 
+                        chunk.packed_size
+                    };
+                }
+            }
+            
+            g_prefetchBuffer.active = true;
+        }
+    }
+    // ==================== END I/O MERGING ====================
+
 #if ILMTHREAD_THREADING_ENABLED
     if (nTiles > 1 && numThreads > 1)
     {
-        // we need the lifetime of this to last longer than the
-        // lifetime of the task group below such that we don't get use
-        // after free type error, so use scope rules to accomplish
-        // this
         TileProcessGroup tpg (numThreads);
 
         {
             ILMTHREAD_NAMESPACE::TaskGroup tg;
 
+            if (usePrefetch && !allChunks.empty())
+            {
+                // Reuse collected chunk info
+                for (const auto& chunk : allChunks)
+                {
+                    ILMTHREAD_NAMESPACE::ThreadPool::addGlobalTask (
+                        new TileBufferTask (&tg, this, &tpg, &frameBuffer, chunk) );
+                }
+            }
+            else
+            {
+                for (int ty = dy1; ty <= dy2; ++ty)
+                {
+                    for (int tx = dx1; tx <= dx2; ++tx)
+                    {
+                        exr_result_t rv = exr_read_tile_chunk_info (
+                            *_ctxt, partNumber, tx, ty, lx, ly, &cinfo);
+                        if (EXR_ERR_INCOMPLETE_CHUNK_TABLE == rv)
+                        {
+                            THROW (
+                                IEX_NAMESPACE::InputExc,
+                                "Tile (" << tx << ", " << ty << ", " << lx << ", " << ly
+                                << ") is missing.");
+                        }
+                        else if (EXR_ERR_SUCCESS != rv)
+                            throw IEX_NAMESPACE::InputExc ("Unable to query tile information");
+
+                        ILMTHREAD_NAMESPACE::ThreadPool::addGlobalTask (
+                            new TileBufferTask (&tg, this, &tpg, &frameBuffer, cinfo) );
+                    }
+                }
+            }
+        }
+
+        tpg.throw_on_failure ();
+    }
+    else
+#endif
+    {
+        TileProcess tp;
+
+        if (usePrefetch && !allChunks.empty())
+        {
+            // Reuse collected chunk info
+            for (const auto& chunk : allChunks)
+            {
+                tp.cinfo = chunk;
+                tp.run_decode (
+                    *_ctxt,
+                    partNumber,
+                    &frameBuffer,
+                    fill_list);
+            }
+        }
+        else
+        {
             for (int ty = dy1; ty <= dy2; ++ty)
             {
                 for (int tx = dx1; tx <= dx2; ++tx)
@@ -792,43 +1145,20 @@ void TiledInputFile::Data::readTiles (int dx1, int dx2, int dy1, int dy2, int lx
                     else if (EXR_ERR_SUCCESS != rv)
                         throw IEX_NAMESPACE::InputExc ("Unable to query tile information");
 
-                    ILMTHREAD_NAMESPACE::ThreadPool::addGlobalTask (
-                        new TileBufferTask (&tg, this, &tpg, &frameBuffer, cinfo) );
+                    tp.cinfo = cinfo;
+                    tp.run_decode (
+                        *_ctxt,
+                        partNumber,
+                        &frameBuffer,
+                        fill_list);
                 }
             }
         }
-
-        tpg.throw_on_failure ();
     }
-    else
-#endif
-    {
-        TileProcess tp;
-
-        for (int ty = dy1; ty <= dy2; ++ty)
-        {
-            for (int tx = dx1; tx <= dx2; ++tx)
-            {
-                exr_result_t rv = exr_read_tile_chunk_info (
-                    *_ctxt, partNumber, tx, ty, lx, ly, &cinfo);
-                if (EXR_ERR_INCOMPLETE_CHUNK_TABLE == rv)
-                {
-                    THROW (
-                        IEX_NAMESPACE::InputExc,
-                        "Tile (" << tx << ", " << ty << ", " << lx << ", " << ly
-                        << ") is missing.");
-                }
-                else if (EXR_ERR_SUCCESS != rv)
-                    throw IEX_NAMESPACE::InputExc ("Unable to query tile information");
-
-                tp.cinfo = cinfo;
-                tp.run_decode (
-                    *_ctxt,
-                    partNumber,
-                    &frameBuffer,
-                    fill_list);
-            }
-        }
+    
+    // Clean up prefetch state (keep buffer capacity for reuse)
+    if (g_prefetchBuffer.active) {
+        g_prefetchBuffer.active = false;
     }
 }
 
@@ -866,6 +1196,7 @@ void TileProcess::run_decode (
 {
     int absX, absY, tileX, tileY;
     exr_attr_box2i_t dw;
+    uint16_t prevFlags = 0;
 
     // stash the flag off to make sure to clean up in the event
     // of an exception by changing the flag after init...
@@ -887,7 +1218,14 @@ void TileProcess::run_decode (
         {
             throw IEX_NAMESPACE::IoExc ("Unable to update decode pipeline");
         }
+        prevFlags = decoder.decode_flags;
     }
+
+    // Apply non-temporal writes flag if enabled globally
+    if (g_useNonTemporalWrites.load(std::memory_order_relaxed))
+        decoder.decode_flags |= EXR_DECODE_NON_TEMPORAL_WRITES;
+    else
+        decoder.decode_flags &= ~EXR_DECODE_NON_TEMPORAL_WRITES;
 
     if (EXR_ERR_SUCCESS != exr_get_data_window (ctxt, pn, &dw))
         throw IEX_NAMESPACE::ArgExc ("Unable to query the data window.");
@@ -901,13 +1239,20 @@ void TileProcess::run_decode (
 
     update_pointers (outfb, dw.min.x, dw.min.y, absX, absY);
 
-    if (isfirst)
+    // Re-choose routines if flags changed (for non-temporal writes support)
+    if (isfirst || prevFlags != decoder.decode_flags)
     {
         if (EXR_ERR_SUCCESS !=
             exr_decoding_choose_default_routines (ctxt, pn, &decoder))
         {
             throw IEX_NAMESPACE::IoExc ("Unable to choose decoder routines");
         }
+    }
+
+    // If prefetch buffer is active, use custom read function
+    if (g_prefetchBuffer.active)
+    {
+        decoder.read_fn = &prefetched_read_chunk;
     }
 
     if (EXR_ERR_SUCCESS != exr_decoding_run (ctxt, pn, &decoder))
@@ -922,6 +1267,46 @@ void TileProcess::update_pointers (const FrameBuffer *outfb, int fb_absX, int fb
 {
     decoder.user_line_begin_skip = 0;
     decoder.user_line_end_ignore = 0;
+    decoder.user_pixel_begin_skip = 0;
+    decoder.user_pixel_end_ignore = 0;
+    
+    // Apply X crop if configured
+    // t_absX is the absolute X position of the tile's left edge
+    // cinfo.width is the tile width
+    int tileXMin = t_absX;
+    int tileXMax = t_absX + cinfo.width - 1;
+    
+    if (g_xCropConfig.cropXMin >= 0 && g_xCropConfig.cropXMax >= 0)
+    {
+        // Calculate how much to skip at the beginning and end of each line
+        if (g_xCropConfig.cropXMin > tileXMin)
+        {
+            decoder.user_pixel_begin_skip = g_xCropConfig.cropXMin - tileXMin;
+        }
+        if (g_xCropConfig.cropXMax < tileXMax)
+        {
+            decoder.user_pixel_end_ignore = tileXMax - g_xCropConfig.cropXMax;
+        }
+    }
+    
+    // Apply Y crop if configured
+    // t_absY is the absolute Y position of the tile's top edge
+    // cinfo.height is the tile height
+    int tileYMin = t_absY;
+    int tileYMax = t_absY + cinfo.height - 1;
+    
+    if (g_yCropConfig.cropYMin >= 0 && g_yCropConfig.cropYMax >= 0)
+    {
+        // Calculate how many lines to skip at the beginning and end
+        if (g_yCropConfig.cropYMin > tileYMin)
+        {
+            decoder.user_line_begin_skip = g_yCropConfig.cropYMin - tileYMin;
+        }
+        if (g_yCropConfig.cropYMax < tileYMax)
+        {
+            decoder.user_line_end_ignore = tileYMax - g_yCropConfig.cropYMax;
+        }
+    }
 
     for (int c = 0; c < decoder.channel_count; ++c)
     {
@@ -944,6 +1329,24 @@ void TileProcess::update_pointers (const FrameBuffer *outfb, int fb_absX, int fb
 
         int xOffset = fbslice->xTileCoords ? 0 : t_absX;
         int yOffset = fbslice->yTileCoords ? 0 : t_absY;
+        
+        // Adjust xOffset for X crop - the output pointer should point to where 
+        // the first non-skipped pixel should go
+        if (decoder.user_pixel_begin_skip > 0 && !fbslice->xTileCoords)
+        {
+            // When using X crop, the output buffer expects data to start at the crop position
+            // So we add the skip amount to align the output correctly
+            xOffset += decoder.user_pixel_begin_skip;
+        }
+        
+        // Adjust yOffset for Y crop - the output pointer should point to where
+        // the first non-skipped line should go
+        if (decoder.user_line_begin_skip > 0 && !fbslice->yTileCoords)
+        {
+            // When using Y crop, the output buffer expects data to start at the crop position
+            // So we add the skip amount to align the output correctly
+            yOffset += decoder.user_line_begin_skip;
+        }
 
         curchan.user_bytes_per_element = (fbslice->type == HALF) ? 2 : 4;
         curchan.user_data_type         = (exr_pixel_type_t)fbslice->type;

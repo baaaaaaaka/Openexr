@@ -21,6 +21,10 @@ public:
     PyFile(const std::string& filename, bool separate_channels = false, bool header_only = false);
     PyFile(const py::dict& header, const py::dict& channels);
     PyFile(const py::list& parts);
+    
+    // New: Construct from memory buffer (for Lustre/GPFS optimization)
+    // This avoids multiple small I/O calls by reading entire file into memory first
+    PyFile(const py::bytes& data, bool separate_channels = false, bool header_only = false);
 
     py::object   __enter__();
     void         __exit__(py::args args);
@@ -48,6 +52,52 @@ public:
     // New: Check if part is tiled
     bool         isTiled(int part_index = 0);
     
+    // New: Zero-copy read directly into external buffer (CHW float32 format)
+    // This is optimized for PyTorch tensor integration.
+    // Coordinates use half-open intervals: [xMin, xMax), [yMin, yMax)
+    // Returns actual number of channels written (1, 3, or 4)
+    int          readRegionToBuffer(
+                     int xMin, int yMin, int xMax, int yMax,  // crop region (half-open)
+                     int out_channels,                        // desired output channels (1/3/4)
+                     py::object out_tensor,                   // PyTorch tensor or numpy array with data_ptr
+                     int64_t stride_c,                        // channel stride (in float elements)
+                     int64_t stride_y,                        // row stride (in float elements)
+                     int64_t stride_x,                        // pixel stride (in float elements)
+                     bool drop_alpha = false,                 // drop alpha even if present
+                     int part_index = 0
+                 );
+    
+    // Lustre-optimized version: uses I/O merging to minimize I/O calls
+    // Automatically analyzes required tiles and merges adjacent reads
+    // Best for: Lustre/GPFS, crop mode, zero-copy
+    int          readRegionToBufferLustre(
+                     int xMin, int yMin, int xMax, int yMax,
+                     int out_channels,
+                     py::object out_tensor,
+                     int64_t stride_c,
+                     int64_t stride_y,
+                     int64_t stride_x,
+                     bool drop_alpha = false,
+                     int part_index = 0
+                 );
+    
+    // Get chunk offset information for tiles in a region
+    // Returns list of dicts with tile info including file offset and size
+    py::list     getTileChunkOffsets(int xMin, int yMin, int xMax, int yMax, int part_index = 0);
+    
+    // Read region with I/O merging - only reads the file range containing required tiles
+    // This is the optimal mode for Lustre: minimal I/O count AND minimal data transfer
+    int          readRegionToBufferMergedIO(
+                     int xMin, int yMin, int xMax, int yMax,
+                     int out_channels,
+                     py::object out_tensor,
+                     int64_t stride_c,
+                     int64_t stride_y,
+                     int64_t stride_x,
+                     bool drop_alpha = false,
+                     int part_index = 0
+                 );
+    
     std::string  filename;
     py::list     parts;
 
@@ -55,6 +105,11 @@ protected:
     
     bool                                _header_only;
     std::unique_ptr<MultiPartInputFile> _inputFile;
+    
+    // For memory stream: hold the data and stream object
+    // These must outlive _inputFile
+    std::string                         _memoryData;
+    std::unique_ptr<StdISStream>        _memoryStream;
     
     py::object   getAttributeObject(const std::string& name, const Attribute* a);
     

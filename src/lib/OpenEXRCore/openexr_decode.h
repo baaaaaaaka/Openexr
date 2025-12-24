@@ -55,6 +55,26 @@ extern "C" {
 #define EXR_DECODE_SAMPLE_DATA_ONLY ((uint16_t) (1 << 2))
 
 /**
+ * Use non-temporal (streaming) writes for output data.
+ *
+ * When set, the unpack routines will use non-temporal store instructions
+ * (e.g., _mm256_stream_ps) which bypass the CPU cache and write directly
+ * to main memory. This is beneficial when:
+ * - The output data will not be read again soon
+ * - You want to preserve CPU cache for the decompression buffer
+ * - You are processing large amounts of data
+ *
+ * Trade-offs:
+ * - Reduces cache pollution from output writes
+ * - May be slower if output data is needed immediately after decoding
+ * - Requires output buffers to be 32-byte aligned for best performance
+ *
+ * This is particularly useful for machine learning data loaders where
+ * decoded data is immediately transferred to GPU memory.
+ */
+#define EXR_DECODE_NON_TEMPORAL_WRITES ((uint16_t) (1 << 3))
+
+/**
  * Struct meant to be used on a per-thread basis for reading exr data
  *
  * As should be obvious, this structure is NOT thread safe, but rather
@@ -103,6 +123,16 @@ typedef struct _exr_decode_pipeline
      * output is meant to be N lines smaller
      */
     int32_t user_line_end_ignore;
+
+    /** How many pixels to skip at the beginning of each line (X crop).
+     * The output pointer should already account for this skip.
+     */
+    int32_t user_pixel_begin_skip;
+
+    /** How many pixels to ignore at the end of each line (X crop).
+     * The output width is (chunk.width - user_pixel_begin_skip - user_pixel_end_ignore).
+     */
+    int32_t user_pixel_end_ignore;
 
     /** How many bytes were actually decoded when items compressed */
     uint64_t bytes_decompressed;

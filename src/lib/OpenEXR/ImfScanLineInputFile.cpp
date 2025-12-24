@@ -23,6 +23,130 @@
 #include "ImfInputPartData.h"
 
 #include <vector>
+#include <algorithm>
+#include <unordered_map>
+#include <cstring>
+#include <atomic>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#else
+#include <windows.h>
+#endif
+
+// Reference to global I/O merge flag (defined in ImfTiledInputFile.cpp)
+extern std::atomic<bool> g_enableIOMerge;
+
+// Thread-local prefetch buffer for scanline I/O merging
+struct ScanLinePrefetchBuffer {
+    std::vector<uint8_t> data;
+    std::unordered_map<uint64_t, std::pair<size_t, size_t>> offsetMap;  // offset -> (buffer_pos, size)
+    bool active = false;
+};
+static thread_local ScanLinePrefetchBuffer g_scanlinePrefetchBuffer;
+
+// Custom read function that uses prefetched scanline data - zero-copy version
+static exr_result_t
+scanline_prefetched_read_chunk(exr_decode_pipeline_t* decode)
+{
+    if (!g_scanlinePrefetchBuffer.active) {
+        return EXR_ERR_INVALID_ARGUMENT;
+    }
+    
+    uint64_t dataOffset = decode->chunk.data_offset;
+    auto it = g_scanlinePrefetchBuffer.offsetMap.find(dataOffset);
+    if (it == g_scanlinePrefetchBuffer.offsetMap.end()) {
+        return EXR_ERR_INVALID_ARGUMENT;
+    }
+    
+    size_t bufferPos = it->second.first;
+    
+    // Zero-copy: point directly to prefetch buffer
+    if (decode->packed_buffer && decode->packed_alloc_size > 0 && decode->free_fn) {
+        decode->free_fn(EXR_TRANSCODE_BUFFER_PACKED, decode->packed_buffer);
+    }
+    
+    decode->packed_buffer = g_scanlinePrefetchBuffer.data.data() + bufferPos;
+    decode->packed_alloc_size = 0;  // Mark as not owned - prevents free
+    
+    return EXR_ERR_SUCCESS;
+}
+
+// Helper: read multiple ranges from file using a single open
+static bool 
+scanlineReadMultipleRanges(const char* filename, 
+                           const std::vector<std::pair<uint64_t, uint64_t>>& ranges,
+                           uint8_t* buffer)
+{
+#ifndef _WIN32
+    int fd = open(filename, O_RDONLY);
+    if (fd < 0) return false;
+    
+    size_t bufferPos = 0;
+    for (const auto& r : ranges) {
+        ssize_t bytesRead = pread(fd, buffer + bufferPos, r.second, static_cast<off_t>(r.first));
+        if (bytesRead != static_cast<ssize_t>(r.second)) {
+            close(fd);
+            return false;
+        }
+        bufferPos += r.second;
+    }
+    
+    close(fd);
+    return true;
+#else
+    HANDLE hFile = CreateFileA(filename, GENERIC_READ, FILE_SHARE_READ, 
+                               NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+    
+    size_t bufferPos = 0;
+    for (const auto& r : ranges) {
+        OVERLAPPED overlapped = {};
+        overlapped.Offset = static_cast<DWORD>(r.first);
+        overlapped.OffsetHigh = static_cast<DWORD>(r.first >> 32);
+        
+        DWORD bytesRead = 0;
+        BOOL success = ReadFile(hFile, buffer + bufferPos, static_cast<DWORD>(r.second), &bytesRead, &overlapped);
+        if (!success || bytesRead != r.second) {
+            CloseHandle(hFile);
+            return false;
+        }
+        bufferPos += r.second;
+    }
+    
+    CloseHandle(hFile);
+    return true;
+#endif
+}
+
+// Helper: merge adjacent byte ranges
+static std::vector<std::pair<uint64_t, uint64_t>> 
+mergeScanlineIOranges(std::vector<std::pair<uint64_t, uint64_t>>& ranges, uint64_t gapThreshold = 4096)
+{
+    if (ranges.empty()) return {};
+    
+    std::sort(ranges.begin(), ranges.end());
+    
+    std::vector<std::pair<uint64_t, uint64_t>> merged;
+    merged.push_back(ranges[0]);
+    
+    for (size_t i = 1; i < ranges.size(); ++i) {
+        auto& last = merged.back();
+        const auto& curr = ranges[i];
+        
+        uint64_t lastEnd = last.first + last.second;
+        
+        if (curr.first <= lastEnd + gapThreshold) {
+            uint64_t newEnd = std::max(lastEnd, curr.first + curr.second);
+            last.second = newEnd - last.first;
+        } else {
+            merged.push_back(curr);
+        }
+    }
+    
+    return merged;
+}
 
 OPENEXR_IMF_INTERNAL_NAMESPACE_SOURCE_ENTER
 
@@ -439,32 +563,114 @@ void ScanLineInputFile::Data::readPixels (
             << dw.min.y << " - " << dw.max.y);
     }
 
-#if ILMTHREAD_THREADING_ENABLED
-    int64_t nchunks;
-    nchunks = ((int64_t) scanLine2 - (int64_t) scanLine1);
+    // ==================== I/O MERGING FOR SCANLINES ====================
+    int64_t nchunks = ((int64_t) scanLine2 - (int64_t) scanLine1);
     nchunks /= (int64_t) scansperchunk;
     nchunks += 1;
+    
+    bool usePrefetch = g_enableIOMerge.load(std::memory_order_relaxed) && nchunks > 1;
+    std::vector<exr_chunk_info_t> allChunks;  // Reused if prefetch enabled
+    
+    if (usePrefetch)
+    {
+        // Phase 1: Collect all chunk info (reused in decode loop for multi-threaded)
+        allChunks.reserve(nchunks);
+        std::vector<std::pair<uint64_t, uint64_t>> ioRanges;
+        ioRanges.reserve(nchunks);
+        
+        for (int y = scanLine1; y <= scanLine2; )
+        {
+            exr_chunk_info_t chunk;
+            if (EXR_ERR_SUCCESS != exr_read_scanline_chunk_info (*_ctxt, partNumber, y, &chunk))
+                throw IEX_NAMESPACE::InputExc ("Unable to query scanline information");
+            
+            allChunks.push_back(chunk);
+            ioRanges.push_back({chunk.data_offset, chunk.packed_size});
+            
+            y += scansperchunk - (y - chunk.start_y);
+        }
+        
+        // Phase 2: Merge adjacent ranges and calculate total size
+        auto mergedRanges = mergeScanlineIOranges(ioRanges, 4096);
+        
+        size_t totalSize = 0;
+        for (const auto& r : mergedRanges) {
+            totalSize += r.second;
+        }
+        
+        g_scanlinePrefetchBuffer.data.resize(totalSize);
+        g_scanlinePrefetchBuffer.offsetMap.clear();
+        g_scanlinePrefetchBuffer.offsetMap.reserve(nchunks);
+        
+        // Phase 3: Read merged ranges (single file open)
+        const char* filename = _ctxt->fileName();
+        if (!filename || filename[0] == '\0') {
+            usePrefetch = false;
+            allChunks.clear();
+        }
+        else
+        {
+            if (!scanlineReadMultipleRanges(filename, mergedRanges, g_scanlinePrefetchBuffer.data.data())) {
+                throw IEX_NAMESPACE::IoExc ("Failed to prefetch scanline data");
+            }
+            
+            // Build offset map with single pass
+            std::vector<std::pair<uint64_t, size_t>> rangeStartToBufferPos;
+            rangeStartToBufferPos.reserve(mergedRanges.size());
+            size_t bufferPos = 0;
+            for (const auto& r : mergedRanges) {
+                rangeStartToBufferPos.push_back({r.first, bufferPos});
+                bufferPos += r.second;
+            }
+            
+            for (const auto& chunk : allChunks) {
+                auto it = std::upper_bound(rangeStartToBufferPos.begin(), rangeStartToBufferPos.end(),
+                                          std::make_pair(chunk.data_offset, SIZE_MAX));
+                if (it != rangeStartToBufferPos.begin()) {
+                    --it;
+                    g_scanlinePrefetchBuffer.offsetMap[chunk.data_offset] = {
+                        it->second + (chunk.data_offset - it->first),
+                        chunk.packed_size
+                    };
+                }
+            }
+            
+            g_scanlinePrefetchBuffer.active = true;
+        }
+    }
+    // ==================== END I/O MERGING ====================
 
+#if ILMTHREAD_THREADING_ENABLED
     if (nchunks > 1 && numThreads > 1)
     {
-        // we need the lifetime of this to last longer than the
-        // lifetime of the task group below such that we don't get use
-        // after free type error, so use scope rules to accomplish
-        // this
         ScanLineProcessGroup sg (numThreads);
 
         {
             ILMTHREAD_NAMESPACE::TaskGroup tg;
 
-            for (int y = scanLine1; y <= scanLine2; )
+            if (usePrefetch && !allChunks.empty())
             {
-                if (EXR_ERR_SUCCESS != exr_read_scanline_chunk_info (*_ctxt, partNumber, y, &cinfo))
-                    throw IEX_NAMESPACE::InputExc ("Unable to query scanline information");
+                // Reuse collected chunk info
+                int y = scanLine1;
+                for (const auto& chunk : allChunks)
+                {
+                    ILMTHREAD_NAMESPACE::ThreadPool::addGlobalTask (
+                        new LineBufferTask (&tg, this, &sg, &fb, chunk, y, scanLine2) );
+                    y += scansperchunk - (y - chunk.start_y);
+                }
+            }
+            else
+            {
+                for (int y = scanLine1; y <= scanLine2; )
+                {
+                    if (EXR_ERR_SUCCESS != exr_read_scanline_chunk_info (*_ctxt, partNumber, y, &cinfo))
+                        throw IEX_NAMESPACE::InputExc ("Unable to query scanline information");
 
-                ILMTHREAD_NAMESPACE::ThreadPool::addGlobalTask (
-                    new LineBufferTask (&tg, this, &sg, &fb, cinfo, y, scanLine2) );
+                    ILMTHREAD_NAMESPACE::ThreadPool::addGlobalTask (
+                        new LineBufferTask (&tg, this, &sg, &fb, cinfo, y, scanLine2) );
 
-                y += scansperchunk - (y - cinfo.start_y);
+                    y += scansperchunk - (y - cinfo.start_y);
+                }
             }
         }
 
@@ -510,6 +716,11 @@ void ScanLineInputFile::Data::readPixels (
         }
 
         checkinScan (sp);
+    }
+    
+    // Clean up prefetch state (keep buffer capacity for reuse)
+    if (g_scanlinePrefetchBuffer.active) {
+        g_scanlinePrefetchBuffer.active = false;
     }
 }
 
@@ -581,6 +792,12 @@ void ScanLineProcess::run_decode (
         {
             throw IEX_NAMESPACE::IoExc ("Unable to choose decoder routines");
         }
+    }
+
+    // If prefetch buffer is active, use custom read function
+    if (g_scanlinePrefetchBuffer.active)
+    {
+        decoder.read_fn = &scanline_prefetched_read_chunk;
     }
 
     last_decode_err = exr_decoding_run (ctxt, pn, &decoder);

@@ -13,6 +13,31 @@
 
 /**************************************/
 
+/* Prefetch macros for better cache utilization */
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#    include <xmmintrin.h>
+#    define EXR_PREFETCH_T0(addr) _mm_prefetch((const char*)(addr), _MM_HINT_T0)
+#    define EXR_PREFETCH_T1(addr) _mm_prefetch((const char*)(addr), _MM_HINT_T1)
+#    define EXR_PREFETCH_NTA(addr) _mm_prefetch((const char*)(addr), _MM_HINT_NTA)
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#    define EXR_PREFETCH_T0(addr) __builtin_prefetch((const void*)(addr), 0, 3)
+#    define EXR_PREFETCH_T1(addr) __builtin_prefetch((const void*)(addr), 0, 2)
+#    define EXR_PREFETCH_NTA(addr) __builtin_prefetch((const void*)(addr), 0, 0)
+#elif defined(__GNUC__) || defined(__clang__)
+#    define EXR_PREFETCH_T0(addr) __builtin_prefetch((const void*)(addr), 0, 3)
+#    define EXR_PREFETCH_T1(addr) __builtin_prefetch((const void*)(addr), 0, 2)
+#    define EXR_PREFETCH_NTA(addr) __builtin_prefetch((const void*)(addr), 0, 0)
+#else
+#    define EXR_PREFETCH_T0(addr) ((void)0)
+#    define EXR_PREFETCH_T1(addr) ((void)0)
+#    define EXR_PREFETCH_NTA(addr) ((void)0)
+#endif
+
+/* Prefetch distance in cache lines (64 bytes each) */
+#define EXR_PREFETCH_DISTANCE 4
+
+/**************************************/
+
 /* TODO: learn arm neon intrinsics for this */
 #if (defined(__x86_64__) || defined(_M_X64))
 #    if defined(__AVX__) && (defined(__F16C__) || defined(__GNUC__) || defined(__clang__))
@@ -40,6 +65,81 @@ half_to_float_buffer_f16c (float* out, const uint16_t* in, int w)
         w -= 8;
     }
     // gcc < 9 does not have loadu_si64
+#    if defined(__clang__) || (__GNUC__ >= 9)
+    switch (w)
+    {
+        case 7:
+            _mm_storeu_ps (out, _mm_cvtph_ps (_mm_loadu_si64 (in)));
+            out[4] = half_to_float (in[4]);
+            out[5] = half_to_float (in[5]);
+            out[6] = half_to_float (in[6]);
+            break;
+        case 6:
+            _mm_storeu_ps (out, _mm_cvtph_ps (_mm_loadu_si64 (in)));
+            out[4] = half_to_float (in[4]);
+            out[5] = half_to_float (in[5]);
+            break;
+        case 5:
+            _mm_storeu_ps (out, _mm_cvtph_ps (_mm_loadu_si64 (in)));
+            out[4] = half_to_float (in[4]);
+            break;
+        case 4: _mm_storeu_ps (out, _mm_cvtph_ps (_mm_loadu_si64 (in))); break;
+        case 3:
+            out[0] = half_to_float (in[0]);
+            out[1] = half_to_float (in[1]);
+            out[2] = half_to_float (in[2]);
+            break;
+        case 2:
+            out[0] = half_to_float (in[0]);
+            out[1] = half_to_float (in[1]);
+            break;
+        case 1: out[0] = half_to_float (in[0]); break;
+    }
+#    else
+    while (w > 0)
+    {
+        *out++ = half_to_float (*in++);
+        --w;
+    }
+#    endif
+}
+
+/*
+ * Non-temporal (streaming) store version for F16C path.
+ * Uses _mm256_stream_ps to bypass cache on output writes.
+ * This keeps the decompression buffer in cache while writing output.
+ */
+#    if defined(USE_F16C_INTRINSICS)
+static inline void
+half_to_float_buffer_nt (float* out, const uint16_t* in, int w)
+#    elif defined(ENABLE_F16C_TEST)
+__attribute__ ((target ("f16c,avx"))) static void
+half_to_float_buffer_nt_f16c (float* out, const uint16_t* in, int w)
+#    endif
+{
+    /* Handle unaligned prefix (stream requires 32-byte alignment) */
+    uintptr_t addr = (uintptr_t) out;
+    size_t misalign = (32 - (addr & 31)) & 31;
+    size_t prefix_floats = misalign / sizeof(float);
+    
+    while (prefix_floats > 0 && w > 0)
+    {
+        *out++ = half_to_float (*in++);
+        --w;
+        --prefix_floats;
+    }
+    
+    /* Main loop: 8 floats at a time with streaming stores */
+    while (w >= 8)
+    {
+        __m256 vals = _mm256_cvtph_ps (_mm_loadu_si128 ((const __m128i*) in));
+        _mm256_stream_ps (out, vals);
+        out += 8;
+        in += 8;
+        w -= 8;
+    }
+    
+    /* Handle remaining floats */
 #    if defined(__clang__) || (__GNUC__ >= 9)
     switch (w)
     {
@@ -148,10 +248,36 @@ half_to_float_buffer_impl (float* out, const uint16_t* in, int w)
 static void (*half_to_float_buffer) (float*, const uint16_t*, int) =
     &half_to_float_buffer_impl;
 
+/* Non-temporal version function pointer (for runtime selection) */
+static void
+half_to_float_buffer_nt_impl (float* out, const uint16_t* in, int w)
+{
+    /* Fallback non-NT implementation for non-F16C path */
+    while (w >= 8)
+    {
+        half_to_float8 (out, in);
+        out += 8;
+        in += 8;
+        w -= 8;
+    }
+    while (w > 0)
+    {
+        *out++ = half_to_float (*in++);
+        --w;
+    }
+}
+
+static void (*half_to_float_buffer_nt) (float*, const uint16_t*, int) =
+    &half_to_float_buffer_nt_impl;
+
 static inline void
 choose_half_to_float_impl (void)
 {
-    if (has_native_half ()) half_to_float_buffer = &half_to_float_buffer_f16c;
+    if (has_native_half ())
+    {
+        half_to_float_buffer = &half_to_float_buffer_f16c;
+        half_to_float_buffer_nt = &half_to_float_buffer_nt_f16c;
+    }
 }
 
 #endif /* ENABLE_F16C_TEST */
@@ -204,11 +330,162 @@ half_to_float_buffer (float* out, const uint16_t* in, int w)
 #    endif
 }
 
+/* Non-temporal version for non-F16C path (falls back to regular writes) */
+static inline void
+half_to_float_buffer_nt (float* out, const uint16_t* in, int w)
+{
+    /* Without F16C, just use regular implementation */
+    /* In the future, could use SSE2 streaming stores with software half conversion */
+    half_to_float_buffer (out, in, w);
+}
+
 static void
 choose_half_to_float_impl (void)
 {}
 
 #endif
+
+/**************************************/
+
+/*
+ * Non-temporal planar unpack functions.
+ * These use streaming stores to bypass cache on output.
+ */
+
+static exr_result_t
+unpack_half_to_float_3chan_planar_nt (exr_decode_pipeline_t* decode)
+{
+    /* Same as unpack_half_to_float_3chan_planar but uses NT stores */
+    const uint8_t*  srcbuffer = decode->unpacked_buffer;
+    const uint16_t *in0, *in1, *in2;
+    uint8_t *       out0, *out1, *out2;
+    int             w, h, out_w, x_skip;
+    int             linc0, linc1, linc2;
+
+    w      = decode->channels[0].width;
+    h      = decode->chunk.height - decode->user_line_end_ignore;
+    x_skip = decode->user_pixel_begin_skip;
+    out_w  = w - x_skip - decode->user_pixel_end_ignore;
+    
+    /* If no X crop, use full width */
+    if (out_w <= 0 || out_w > w) out_w = w;
+    if (x_skip < 0) x_skip = 0;
+
+    linc0 = decode->channels[0].user_line_stride;
+    linc1 = decode->channels[1].user_line_stride;
+    linc2 = decode->channels[2].user_line_stride;
+
+    out0 = decode->channels[0].decode_to_ptr;
+    out1 = decode->channels[1].decode_to_ptr;
+    out2 = decode->channels[2].decode_to_ptr;
+
+    const size_t line_bytes = (size_t)w * 6;
+    srcbuffer += decode->user_line_begin_skip * w * 6;
+
+    for (int y = decode->user_line_begin_skip; y < h; ++y)
+    {
+        /* Prefetch next line(s) into L1 cache */
+        if (y + EXR_PREFETCH_DISTANCE < h)
+        {
+            const uint8_t* prefetch_addr = srcbuffer + EXR_PREFETCH_DISTANCE * line_bytes;
+            EXR_PREFETCH_T0(prefetch_addr);
+            EXR_PREFETCH_T0(prefetch_addr + 64);
+            EXR_PREFETCH_T0(prefetch_addr + 128);
+        }
+
+        /* Apply X skip to input pointers */
+        in0 = (const uint16_t*) srcbuffer + x_skip;
+        in1 = (const uint16_t*) srcbuffer + w + x_skip;
+        in2 = (const uint16_t*) srcbuffer + w * 2 + x_skip;
+        srcbuffer += w * 6;
+        
+        /* Use non-temporal stores - convert only output width */
+        half_to_float_buffer_nt ((float*) out0, in0, out_w);
+        half_to_float_buffer_nt ((float*) out1, in1, out_w);
+        half_to_float_buffer_nt ((float*) out2, in2, out_w);
+
+        out0 += linc0;
+        out1 += linc1;
+        out2 += linc2;
+    }
+
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__SSE__) || defined(_M_AMD64))
+    /* Ensure all streaming stores are visible */
+    _mm_sfence ();
+#endif
+
+    return EXR_ERR_SUCCESS;
+}
+
+static exr_result_t
+unpack_half_to_float_4chan_planar_nt (exr_decode_pipeline_t* decode)
+{
+    /* Same as unpack_half_to_float_4chan_planar but uses NT stores */
+    const uint8_t*  srcbuffer = decode->unpacked_buffer;
+    const uint16_t *in0, *in1, *in2, *in3;
+    uint8_t *       out0, *out1, *out2, *out3;
+    int             w, h, out_w, x_skip;
+    int             linc0, linc1, linc2, linc3;
+
+    w      = decode->channels[0].width;
+    h      = decode->chunk.height - decode->user_line_end_ignore;
+    x_skip = decode->user_pixel_begin_skip;
+    out_w  = w - x_skip - decode->user_pixel_end_ignore;
+    
+    /* If no X crop, use full width */
+    if (out_w <= 0 || out_w > w) out_w = w;
+    if (x_skip < 0) x_skip = 0;
+
+    linc0 = decode->channels[0].user_line_stride;
+    linc1 = decode->channels[1].user_line_stride;
+    linc2 = decode->channels[2].user_line_stride;
+    linc3 = decode->channels[3].user_line_stride;
+
+    out0 = decode->channels[0].decode_to_ptr;
+    out1 = decode->channels[1].decode_to_ptr;
+    out2 = decode->channels[2].decode_to_ptr;
+    out3 = decode->channels[3].decode_to_ptr;
+
+    const size_t line_bytes = (size_t)w * 8;
+    srcbuffer += decode->user_line_begin_skip * w * 8;
+
+    for (int y = decode->user_line_begin_skip; y < h; ++y)
+    {
+        /* Prefetch next line(s) into L1 cache */
+        if (y + EXR_PREFETCH_DISTANCE < h)
+        {
+            const uint8_t* prefetch_addr = srcbuffer + EXR_PREFETCH_DISTANCE * line_bytes;
+            EXR_PREFETCH_T0(prefetch_addr);
+            EXR_PREFETCH_T0(prefetch_addr + 64);
+            EXR_PREFETCH_T0(prefetch_addr + 128);
+            EXR_PREFETCH_T0(prefetch_addr + 192);
+        }
+
+        /* Apply X skip to input pointers */
+        in0 = (const uint16_t*) srcbuffer + x_skip;
+        in1 = (const uint16_t*) srcbuffer + w + x_skip;
+        in2 = (const uint16_t*) srcbuffer + w * 2 + x_skip;
+        in3 = (const uint16_t*) srcbuffer + w * 3 + x_skip;
+        srcbuffer += w * 8;
+        
+        /* Use non-temporal stores - convert only output width */
+        half_to_float_buffer_nt ((float*) out0, in0, out_w);
+        half_to_float_buffer_nt ((float*) out1, in1, out_w);
+        half_to_float_buffer_nt ((float*) out2, in2, out_w);
+        half_to_float_buffer_nt ((float*) out3, in3, out_w);
+
+        out0 += linc0;
+        out1 += linc1;
+        out2 += linc2;
+        out3 += linc3;
+    }
+
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__SSE__) || defined(_M_AMD64))
+    _mm_sfence ();
+#endif
+
+    return EXR_ERR_SUCCESS;
+}
 
 /**************************************/
 
@@ -459,11 +736,20 @@ unpack_half_to_float_3chan_planar (exr_decode_pipeline_t* decode)
     const uint8_t*  srcbuffer = decode->unpacked_buffer;
     const uint16_t *in0, *in1, *in2;
     uint8_t *       out0, *out1, *out2;
-    int             w, h;
+    int             w, h, out_w, x_skip;
     int             linc0, linc1, linc2;
 
-    w     = decode->channels[0].width;
-    h     = decode->chunk.height - decode->user_line_end_ignore;
+    w      = decode->channels[0].width;
+    h      = decode->chunk.height - decode->user_line_end_ignore;
+    x_skip = decode->user_pixel_begin_skip;
+    out_w  = w - x_skip - decode->user_pixel_end_ignore;
+    
+    /* If no X crop, use full width */
+    if (out_w <= 0 || out_w > w) out_w = w;
+    if (x_skip < 0) x_skip = 0;
+
+    const size_t line_bytes = (size_t)w * 6;
+
     linc0 = decode->channels[0].user_line_stride;
     linc1 = decode->channels[1].user_line_stride;
     linc2 = decode->channels[2].user_line_stride;
@@ -481,14 +767,25 @@ unpack_half_to_float_3chan_planar (exr_decode_pipeline_t* decode)
     // planar output
     for (int y = decode->user_line_begin_skip; y < h; ++y)
     {
-        in0 = (const uint16_t*) srcbuffer;
-        in1 = in0 + w;
-        in2 = in1 + w;
-        srcbuffer += w * 6; // 3 * sizeof(uint16_t), avoid type conversion
-                            /* specialise to memcpy if we can */
-        half_to_float_buffer ((float*) out0, in0, w);
-        half_to_float_buffer ((float*) out1, in1, w);
-        half_to_float_buffer ((float*) out2, in2, w);
+        /* Prefetch next line(s) into L1 cache */
+        if (y + EXR_PREFETCH_DISTANCE < h)
+        {
+            const uint8_t* prefetch_addr = srcbuffer + EXR_PREFETCH_DISTANCE * line_bytes;
+            EXR_PREFETCH_T0(prefetch_addr);
+            EXR_PREFETCH_T0(prefetch_addr + 64);
+            EXR_PREFETCH_T0(prefetch_addr + 128);
+        }
+
+        /* Apply X skip to input pointers */
+        in0 = (const uint16_t*) srcbuffer + x_skip;
+        in1 = (const uint16_t*) srcbuffer + w + x_skip;
+        in2 = (const uint16_t*) srcbuffer + w * 2 + x_skip;
+        srcbuffer += w * 6; // 3 * sizeof(uint16_t), advance by full line
+        
+        /* Convert only the output width */
+        half_to_float_buffer ((float*) out0, in0, out_w);
+        half_to_float_buffer ((float*) out1, in1, out_w);
+        half_to_float_buffer ((float*) out2, in2, out_w);
 
         out0 += linc0;
         out1 += linc1;
@@ -833,11 +1130,18 @@ unpack_half_to_float_4chan_planar (exr_decode_pipeline_t* decode)
     const uint8_t*  srcbuffer = decode->unpacked_buffer;
     const uint16_t *in0, *in1, *in2, *in3;
     uint8_t *       out0, *out1, *out2, *out3;
-    int             w, h;
+    int             w, h, out_w, x_skip;
     int             linc0, linc1, linc2, linc3;
 
-    w     = decode->channels[0].width;
-    h     = decode->chunk.height - decode->user_line_end_ignore;
+    w      = decode->channels[0].width;
+    h      = decode->chunk.height - decode->user_line_end_ignore;
+    x_skip = decode->user_pixel_begin_skip;
+    out_w  = w - x_skip - decode->user_pixel_end_ignore;
+    
+    /* If no X crop, use full width */
+    if (out_w <= 0 || out_w > w) out_w = w;
+    if (x_skip < 0) x_skip = 0;
+
     linc0 = decode->channels[0].user_line_stride;
     linc1 = decode->channels[1].user_line_stride;
     linc2 = decode->channels[2].user_line_stride;
@@ -848,6 +1152,8 @@ unpack_half_to_float_4chan_planar (exr_decode_pipeline_t* decode)
     out2 = decode->channels[2].decode_to_ptr;
     out3 = decode->channels[3].decode_to_ptr;
 
+    const size_t line_bytes = (size_t)w * 8;
+
     /*
      * not actually using y in the loop, so just pre-increment
      * the srcbuffer for any skip
@@ -857,16 +1163,28 @@ unpack_half_to_float_4chan_planar (exr_decode_pipeline_t* decode)
     // planar output
     for (int y = decode->user_line_begin_skip; y < h; ++y)
     {
-        in0 = (const uint16_t*) srcbuffer;
-        in1 = in0 + w;
-        in2 = in1 + w;
-        in3 = in2 + w;
-        srcbuffer += w * 8; // 4 * sizeof(uint16_t), avoid type conversion
+        /* Prefetch next line(s) into L1 cache */
+        if (y + EXR_PREFETCH_DISTANCE < h)
+        {
+            const uint8_t* prefetch_addr = srcbuffer + EXR_PREFETCH_DISTANCE * line_bytes;
+            EXR_PREFETCH_T0(prefetch_addr);
+            EXR_PREFETCH_T0(prefetch_addr + 64);
+            EXR_PREFETCH_T0(prefetch_addr + 128);
+            EXR_PREFETCH_T0(prefetch_addr + 192);
+        }
 
-        half_to_float_buffer ((float*) out0, in0, w);
-        half_to_float_buffer ((float*) out1, in1, w);
-        half_to_float_buffer ((float*) out2, in2, w);
-        half_to_float_buffer ((float*) out3, in3, w);
+        /* Apply X skip to input pointers */
+        in0 = (const uint16_t*) srcbuffer + x_skip;
+        in1 = (const uint16_t*) srcbuffer + w + x_skip;
+        in2 = (const uint16_t*) srcbuffer + w * 2 + x_skip;
+        in3 = (const uint16_t*) srcbuffer + w * 3 + x_skip;
+        srcbuffer += w * 8; // 4 * sizeof(uint16_t), advance by full line
+
+        /* Convert only the output width */
+        half_to_float_buffer ((float*) out0, in0, out_w);
+        half_to_float_buffer ((float*) out1, in1, out_w);
+        half_to_float_buffer ((float*) out2, in2, out_w);
+        half_to_float_buffer ((float*) out3, in3, out_w);
 
         out0 += linc0;
         out1 += linc1;
@@ -1719,6 +2037,9 @@ internal_exr_match_decode (
         return &generic_unpack_deep;
     }
 
+    /* Check if non-temporal writes are requested */
+    int use_nt = (decode->decode_flags & EXR_DECODE_NON_TEMPORAL_WRITES) != 0;
+
     if (hastypechange > 0)
     {
         /* other optimizations would not be difficult, but this will
@@ -1747,6 +2068,14 @@ internal_exr_match_decode (
 
             if (sameoutinc == 4)
             {
+                /* Use non-temporal versions if requested */
+                if (use_nt)
+                {
+                    if (decode->channel_count == 4)
+                        return &unpack_half_to_float_4chan_planar_nt;
+                    if (decode->channel_count == 3)
+                        return &unpack_half_to_float_3chan_planar_nt;
+                }
                 if (decode->channel_count == 4)
                     return &unpack_half_to_float_4chan_planar;
                 if (decode->channel_count == 3)
@@ -1802,4 +2131,25 @@ internal_exr_match_decode (
     }
 
     return &generic_unpack;
+}
+
+/**************************************/
+
+/*
+ * External interface for half-to-float conversion.
+ * Uses SIMD when available for optimal performance.
+ */
+void
+internal_half_to_float_buffer (float* out, const uint16_t* in, int count)
+{
+#if defined(USE_F16C_INTRINSICS)
+    half_to_float_buffer (out, in, count);
+#elif defined(ENABLE_F16C_TEST)
+    /* half_to_float_buffer is a function pointer that gets set up
+     * at runtime based on CPU capabilities */
+    half_to_float_buffer (out, in, count);
+#else
+    for (int i = 0; i < count; ++i)
+        out[i] = half_to_float (in[i]);
+#endif
 }

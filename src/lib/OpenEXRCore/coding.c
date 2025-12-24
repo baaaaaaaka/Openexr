@@ -4,6 +4,7 @@
 */
 
 #include "internal_coding.h"
+#include "internal_memory.h"
 #include "internal_util.h"
 
 #include <string.h>
@@ -213,10 +214,8 @@ internal_decode_free_buffer (
                 decode->free_fn (bufid, curbuf);
             else
             {
-                exr_const_context_t ctxt = decode->context;
-                EXR_CHECK_CONTEXT_AND_PART (decode->part_index);
-
-                ctxt->free_fn (curbuf);
+                /* Use cache-line aligned free to match allocation */
+                internal_exr_free_cacheline (curbuf);
             }
         }
         *buf = NULL;
@@ -253,7 +252,8 @@ internal_decode_alloc_buffer (
             exr_const_context_t ctxt = decode->context;
             EXR_CHECK_CONTEXT_AND_PART (decode->part_index);
 
-            curbuf = ctxt->alloc_fn (newsz);
+            /* Use cache-line aligned allocation for better memory performance */
+            curbuf = internal_exr_alloc_cacheline (newsz);
         }
 
         if (curbuf == NULL)
