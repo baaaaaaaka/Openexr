@@ -27,6 +27,7 @@
 #include "ImfTiledMisc.h"
 
 #include "openexr_decode.h"
+#include "openexr_part.h"
 
 // Global flag to enable non-temporal writes for tile decoding.
 // This is useful for ML data loaders where decoded data is immediately
@@ -115,7 +116,7 @@ IMF_EXPORT void clearTileYCrop()
 // I/O Merging support for Lustre/GPFS optimization
 // When enabled, multiple tile reads are merged into fewer large I/O operations
 // This variable is also referenced by ImfScanLineInputFile.cpp
-std::atomic<bool> g_enableIOMerge{false};
+std::atomic<bool> g_enableIOMerge{true};
 
 // Thread-local prefetch buffer and mapping for merged I/O
 struct PrefetchBuffer {
@@ -141,17 +142,23 @@ prefetched_read_chunk(exr_decode_pipeline_t* decode)
     }
     
     size_t bufferPos = it->second.first;
+    size_t expectedSize = it->second.second;
     
-    // Zero-copy: point directly to prefetch buffer
-    // The packed_buffer is only read by the decompressor, not modified
-    // We mark alloc_size as 0 to prevent the decoder from freeing it
-    if (decode->packed_buffer && decode->packed_alloc_size > 0 && decode->free_fn) {
-        // Free any previously allocated buffer
-        decode->free_fn(EXR_TRANSCODE_BUFFER_PACKED, decode->packed_buffer);
+    // Verify buffer position is valid
+    size_t packedSize = decode->chunk.packed_size;
+    if (bufferPos + packedSize > g_prefetchBuffer.data.size()) {
+        return EXR_ERR_OUT_OF_MEMORY;
     }
     
+    // ZERO-COPY approach: Point packed_buffer directly to prefetch buffer
+    // Set packed_alloc_size = 0 to prevent OpenEXR from freeing it
+    // This is safe because:
+    // 1. g_prefetchBuffer.data is valid for the entire readTiles call
+    // 2. TileProcess is destroyed BEFORE we clear g_prefetchBuffer.data
+    // 3. packed_alloc_size = 0 tells OpenEXR "don't free this buffer"
+    
     decode->packed_buffer = g_prefetchBuffer.data.data() + bufferPos;
-    decode->packed_alloc_size = 0;  // Mark as not owned - prevents free
+    decode->packed_alloc_size = 0;  // CRITICAL: Prevents exr_decoding_destroy from freeing
     
     return EXR_ERR_SUCCESS;
 }
@@ -222,8 +229,9 @@ struct TileProcess
 {
     ~TileProcess ()
     {
-        if (!first)
+        if (!first) {
             exr_decoding_destroy (decoder.context, &decoder);
+        }
     }
 
     void run_decode (
@@ -975,93 +983,377 @@ mergeIOranges(std::vector<std::pair<uint64_t, uint64_t>>& ranges, uint64_t gapTh
 
 void TiledInputFile::Data::readTiles (int dx1, int dx2, int dy1, int dy2, int lx, int ly)
 {
+    // CRITICAL: Clear prefetch state at the start of each call
+    // This prevents cross-call state corruption
+    g_prefetchBuffer.active = false;
+    g_prefetchBuffer.offsetMap.clear();
+    // Force deallocation of prefetch buffer to avoid heap corruption
+    std::vector<uint8_t>().swap(g_prefetchBuffer.data);
+    
     int nTiles = dx2 - dx1 + 1;
     nTiles *= dy2 - dy1 + 1;
 
     exr_chunk_info_t      cinfo;
     
     // ==================== I/O MERGING OPTIMIZATION ====================
-    // If I/O merging is enabled and we have multiple tiles, prefetch all data
-    // in merged I/O operations to reduce the number of system calls.
-    // Also collect chunk info once to avoid redundant queries.
+    // When enabled, we batch-read chunk leaders AND pixel data in merged I/O.
+    // This reduces pread calls from ~113 to ~3 for a 10x10 tile region.
+    //
+    // Strategy:
+    // 1. Get chunk offset table (already cached, no I/O)
+    // 2. Batch-read all chunk leaders in one I/O (~2KB for 100 tiles)
+    // 3. Parse leaders in-memory to get packed_size
+    // 4. Batch-read all pixel data in merged I/O
+    
     bool usePrefetch = g_enableIOMerge.load(std::memory_order_relaxed) && nTiles > 1;
-    std::vector<exr_chunk_info_t> allChunks;  // Reused if prefetch enabled
+    std::vector<exr_chunk_info_t> allChunks;
     
     if (usePrefetch)
     {
-        // Phase 1: Collect all chunk info (will be reused in decode loop)
-        allChunks.reserve(nTiles);
-        std::vector<std::pair<uint64_t, uint64_t>> ioRanges;
-        ioRanges.reserve(nTiles);
-        
-        for (int ty = dy1; ty <= dy2; ++ty)
-        {
-            for (int tx = dx1; tx <= dx2; ++tx)
-            {
-                exr_result_t rv = exr_read_tile_chunk_info (
-                    *_ctxt, partNumber, tx, ty, lx, ly, &cinfo);
-                if (EXR_ERR_INCOMPLETE_CHUNK_TABLE == rv)
-                {
-                    THROW (
-                        IEX_NAMESPACE::InputExc,
-                        "Tile (" << tx << ", " << ty << ", " << lx << ", " << ly
-                        << ") is missing.");
-                }
-                else if (EXR_ERR_SUCCESS != rv)
-                    throw IEX_NAMESPACE::InputExc ("Unable to query tile information");
-                
-                allChunks.push_back(cinfo);
-                ioRanges.push_back({cinfo.data_offset, cinfo.packed_size});
-            }
-        }
-        
-        // Phase 2: Merge adjacent ranges and calculate total size
-        auto mergedRanges = mergeIOranges(ioRanges, 4096);
-        
-        size_t totalSize = 0;
-        for (const auto& r : mergedRanges) {
-            totalSize += r.second;
-        }
-        
-        g_prefetchBuffer.data.resize(totalSize);
-        g_prefetchBuffer.offsetMap.clear();
-        g_prefetchBuffer.offsetMap.reserve(nTiles);
-        
-        // Phase 3: Read merged ranges (single file open)
         const char* filename = _ctxt->fileName();
         if (!filename || filename[0] == '\0') {
             usePrefetch = false;
-            allChunks.clear();  // Will need to re-query
         }
         else
         {
-            if (!readMultipleRangesFromFile(filename, mergedRanges, g_prefetchBuffer.data.data())) {
-                throw IEX_NAMESPACE::IoExc ("Failed to prefetch tile data");
-            }
+            // Get chunk offset table (already in memory, no I/O)
+            uint64_t* chunkTable = nullptr;
+            int32_t chunkCount = 0;
+            exr_result_t rv = exr_get_chunk_table(*_ctxt, partNumber, &chunkTable, &chunkCount);
             
-            // Build offset map with single pass
-            std::vector<std::pair<uint64_t, size_t>> rangeStartToBufferPos;
-            rangeStartToBufferPos.reserve(mergedRanges.size());
-            size_t bufferPos = 0;
-            for (const auto& r : mergedRanges) {
-                rangeStartToBufferPos.push_back({r.first, bufferPos});
-                bufferPos += r.second;
+            // Get data window to compute numTilesX
+            exr_attr_box2i_t dw;
+            if (EXR_ERR_SUCCESS != exr_get_data_window(*_ctxt, partNumber, &dw)) {
+                usePrefetch = false;
             }
-            
-            for (const auto& chunk : allChunks) {
-                auto it = std::upper_bound(rangeStartToBufferPos.begin(), rangeStartToBufferPos.end(),
-                                          std::make_pair(chunk.data_offset, SIZE_MAX));
-                if (it != rangeStartToBufferPos.begin()) {
-                    --it;
-                    g_prefetchBuffer.offsetMap[chunk.data_offset] = {
-                        it->second + (chunk.data_offset - it->first), 
-                        chunk.packed_size
-                    };
+            else if (rv != EXR_ERR_SUCCESS || !chunkTable) {
+                usePrefetch = false;
+            }
+            else
+            {
+                // Compute chunk indices and collect offsets for batch leader read.
+                // IMPORTANT: Chunk table indexing depends on tile level mode:
+                // - ONE_LEVEL / MIPMAP: chunkIdx = sum(prev_levels) + ty * numTilesX(level) + tx
+                // - RIPMAP: chunkIdx accounts for (levelx, levely) ordering
+                //
+                // If chunkIdx or per-tile width/height is wrong, the decoder can write past the
+                // user buffer (heap corruption -> free(): invalid next size).
+                exr_tile_level_mode_t levelMode = EXR_TILE_LAST_TYPE;
+                exr_tile_round_mode_t roundMode = EXR_TILE_ROUND_LAST_TYPE;
+                uint32_t descTileW = 0, descTileH = 0;
+                int32_t levelsx = 0, levelsy = 0;
+                int32_t levelPixelW = 0, levelPixelH = 0;
+                int32_t levelTileW = 0, levelTileH = 0;
+                if (EXR_ERR_SUCCESS != exr_get_tile_descriptor(*_ctxt, partNumber, &descTileW, &descTileH, &levelMode, &roundMode) ||
+                    EXR_ERR_SUCCESS != exr_get_tile_levels(*_ctxt, partNumber, &levelsx, &levelsy) ||
+                    EXR_ERR_SUCCESS != exr_get_level_sizes(*_ctxt, partNumber, lx, ly, &levelPixelW, &levelPixelH) ||
+                    EXR_ERR_SUCCESS != exr_get_tile_sizes(*_ctxt, partNumber, lx, ly, &levelTileW, &levelTileH))
+                {
+                    usePrefetch = false;
+                }
+
+                std::vector<int32_t> tileCountX;
+                std::vector<int32_t> tileCountY;
+                if (usePrefetch)
+                {
+                    if (levelMode == EXR_TILE_RIPMAP_LEVELS)
+                    {
+                        tileCountX.assign((size_t)std::max(0, levelsx), 0);
+                        tileCountY.assign((size_t)std::max(0, levelsy), 0);
+                        int32_t tmpx = 0, tmpy = 0;
+                        for (int l = 0; l < levelsx; ++l)
+                        {
+                            if (EXR_ERR_SUCCESS != exr_get_tile_counts(*_ctxt, partNumber, l, 0, &tileCountX[(size_t)l], &tmpy))
+                            {
+                                usePrefetch = false;
+                                break;
+                            }
+                        }
+                        for (int l = 0; l < levelsy; ++l)
+                        {
+                            if (EXR_ERR_SUCCESS != exr_get_tile_counts(*_ctxt, partNumber, 0, l, &tmpx, &tileCountY[(size_t)l]))
+                            {
+                                usePrefetch = false;
+                                break;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        int32_t maxLevels = levelsx;
+                        if (maxLevels <= 0) maxLevels = 1;
+                        tileCountX.assign((size_t)maxLevels, 0);
+                        tileCountY.assign((size_t)maxLevels, 0);
+                        for (int l = 0; l < maxLevels; ++l)
+                        {
+                            if (EXR_ERR_SUCCESS != exr_get_tile_counts(*_ctxt, partNumber, l, l, &tileCountX[(size_t)l], &tileCountY[(size_t)l]))
+                            {
+                                usePrefetch = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                auto computeChunkIdx = [&](int tx, int ty) -> int32_t {
+                    if (!usePrefetch) return -1;
+                    if (tx < 0 || ty < 0 || lx < 0 || ly < 0) return -1;
+                    if (levelMode == EXR_TILE_RIPMAP_LEVELS)
+                    {
+                        if (lx >= levelsx || ly >= levelsy) return -1;
+                        int32_t numx = tileCountX[(size_t)lx];
+                        int32_t numy = tileCountY[(size_t)ly];
+                        if (tx >= numx || ty >= numy) return -1;
+                        int64_t chunkoff = 0;
+                        // Sum all previous Y levels
+                        for (int ylv = 0; ylv < ly; ++ylv)
+                        {
+                            int32_t rowy = tileCountY[(size_t)ylv];
+                            for (int xlv = 0; xlv < levelsx; ++xlv)
+                                chunkoff += (int64_t)tileCountX[(size_t)xlv] * (int64_t)rowy;
+                        }
+                        // Sum previous X levels in this Y level
+                        for (int xlv = 0; xlv < lx; ++xlv)
+                            chunkoff += (int64_t)tileCountX[(size_t)xlv] * (int64_t)numy;
+                        chunkoff += (int64_t)ty * (int64_t)numx + (int64_t)tx;
+                        if (chunkoff < 0 || chunkoff > INT32_MAX) return -1;
+                        return (int32_t)chunkoff;
+                    }
+                    // ONE_LEVEL or MIPMAP_LEVELS (both require lx == ly)
+                    if (lx != ly) return -1;
+                    if (lx < 0 || lx >= (int)tileCountX.size()) return -1;
+                    int32_t numx = tileCountX[(size_t)lx];
+                    int32_t numy = tileCountY[(size_t)lx];
+                    if (tx >= numx || ty >= numy) return -1;
+                    int64_t chunkoff = 0;
+                    for (int l = 0; l < lx; ++l)
+                        chunkoff += (int64_t)tileCountX[(size_t)l] * (int64_t)tileCountY[(size_t)l];
+                    chunkoff += (int64_t)ty * (int64_t)numx + (int64_t)tx;
+                    if (chunkoff < 0 || chunkoff > INT32_MAX) return -1;
+                    return (int32_t)chunkoff;
+                };
+
+                int numTilesX = 0;
+                if (usePrefetch)
+                {
+                    if (levelMode == EXR_TILE_RIPMAP_LEVELS)
+                        numTilesX = (lx >= 0 && lx < (int)tileCountX.size()) ? tileCountX[(size_t)lx] : 0;
+                    else
+                        numTilesX = (lx >= 0 && lx < (int)tileCountX.size()) ? tileCountX[(size_t)lx] : 0;
+                    if (numTilesX <= 0) usePrefetch = false;
+                }
+                struct TileLeaderInfo {
+                    int tx, ty;
+                    int32_t chunkIdx;
+                    uint64_t leaderOffset;
+                };
+                std::vector<TileLeaderInfo> tileInfos;
+                tileInfos.reserve(nTiles);
+                
+                uint64_t minLeaderOffset = UINT64_MAX;
+                uint64_t maxLeaderOffset = 0;
+                
+                for (int ty = dy1; ty <= dy2; ++ty) {
+                    for (int tx = dx1; tx <= dx2; ++tx) {
+                        TileLeaderInfo ti;
+                        ti.tx = tx;
+                        ti.ty = ty;
+                        ti.chunkIdx = computeChunkIdx(tx, ty);
+                        
+                        if (ti.chunkIdx >= 0 && ti.chunkIdx < chunkCount) {
+                            ti.leaderOffset = chunkTable[ti.chunkIdx];
+                            if (ti.leaderOffset > 0) {
+                                minLeaderOffset = std::min(minLeaderOffset, ti.leaderOffset);
+                                maxLeaderOffset = std::max(maxLeaderOffset, ti.leaderOffset);
+                                tileInfos.push_back(ti);
+                            }
+                        }
+                    }
+                }
+                
+                if (tileInfos.empty()) {
+                    usePrefetch = false;
+                }
+                else
+                {
+                    // Leader size: 20 bytes (5 int32) for single-part
+                    size_t leaderSize = 20;  // tx, ty, lx, ly, packed_size
+                    
+                    // Get compression type for chunk info
+                    exr_compression_t compType;
+                    if (EXR_ERR_SUCCESS != exr_get_compression(*_ctxt, partNumber, &compType)) {
+                        usePrefetch = false;
+                    }
+                    else
+                    {
+                        // Get max unpacked size per chunk
+                        uint64_t maxUnpackedSize = 0;
+                        exr_get_chunk_unpacked_size(*_ctxt, partNumber, &maxUnpackedSize);
+                        
+                        size_t maxPackedSizeEstimate = (size_t)maxUnpackedSize;
+                        
+                        // ========== ROW-BASED I/O MERGING ==========
+                        // Each row's tiles are contiguous in the file (row-major order).
+                        // Read per-row ranges to minimize bandwidth while reducing I/O count.
+                        // For 10x10 crop: 10 pread calls instead of 207.
+                        
+                        // Build per-row ranges
+                        struct RowRange {
+                            int ty;
+                            uint64_t startOffset;
+                            uint64_t endOffset;
+                            size_t bufferOffset;
+                        };
+                        std::vector<RowRange> rowRanges;
+                        
+                        int currentRow = -1;
+                        for (const auto& ti : tileInfos) {
+                            uint64_t tileEnd = ti.leaderOffset + leaderSize + maxPackedSizeEstimate;
+                            if (ti.ty != currentRow) {
+                                // Start new row
+                                RowRange rr;
+                                rr.ty = ti.ty;
+                                rr.startOffset = ti.leaderOffset;
+                                rr.endOffset = tileEnd;
+                                rr.bufferOffset = 0;  // Will be set later
+                                rowRanges.push_back(rr);
+                                currentRow = ti.ty;
+                            } else {
+                                // Extend current row
+                                rowRanges.back().endOffset = std::max(rowRanges.back().endOffset, tileEnd);
+                            }
+                        }
+                        
+                        // Calculate buffer offsets and total size
+                        size_t totalBufferSize = 0;
+                        for (auto& rr : rowRanges) {
+                            rr.bufferOffset = totalBufferSize;
+                            totalBufferSize += (rr.endOffset - rr.startOffset);
+                        }
+                        
+                        // Allocate buffer
+                        g_prefetchBuffer.data.resize(totalBufferSize);
+                        
+                        // Read each row range with one pread per row
+                        bool readSuccess = true;
+                        int fd = ::open(filename, O_RDONLY);
+                        if (fd < 0) {
+                            readSuccess = false;
+                        } else {
+                            for (size_t ri = 0; ri < rowRanges.size(); ri++) {
+                                const auto& rr = rowRanges[ri];
+                                size_t size = rr.endOffset - rr.startOffset;
+                                if(rr.bufferOffset + size > g_prefetchBuffer.data.size()) {
+                                    readSuccess = false;
+                                    break;
+                                }
+                                ssize_t bytesRead = ::pread64(fd, 
+                                    g_prefetchBuffer.data.data() + rr.bufferOffset, 
+                                    size, rr.startOffset);
+                                if (bytesRead != (ssize_t)size) {
+                                    readSuccess = false;
+                                    break;
+                                }
+                            }
+                            ::close(fd);
+                        }
+                        
+                        if (!readSuccess) {
+                            usePrefetch = false;
+                        }
+                        else
+                        {
+                            // Parse leaders and build allChunks + offsetMap
+                            allChunks.reserve(nTiles);
+                            g_prefetchBuffer.offsetMap.clear();
+                            g_prefetchBuffer.offsetMap.reserve(nTiles);
+                            
+                            // Map each tile to its row range
+                            size_t rowIdx = 0;
+                            int tilesInRow = 0;
+                            int tilesPerRow = dx2 - dx1 + 1;
+                            
+                            for (const auto& ti : tileInfos) {
+                                // Move to next row if needed
+                                if (tilesInRow >= tilesPerRow && rowIdx + 1 < rowRanges.size()) {
+                                    rowIdx++;
+                                    tilesInRow = 0;
+                                }
+                                
+                                const auto& rr = rowRanges[rowIdx];
+                                size_t bufferPos = rr.bufferOffset + (ti.leaderOffset - rr.startOffset);
+                                
+                                // Parse leader
+                                int32_t* leader = reinterpret_cast<int32_t*>(
+                                    g_prefetchBuffer.data.data() + bufferPos);
+                                int32_t ldr_tx = leader[0];
+                                int32_t ldr_ty = leader[1];
+                                int32_t ldr_lx = leader[2];
+                                int32_t ldr_ly = leader[3];
+                                int32_t packed_size = leader[4];
+                                
+                                if (ldr_tx != ti.tx || ldr_ty != ti.ty || 
+                                    ldr_lx != lx || ldr_ly != ly || packed_size <= 0) {
+                                    allChunks.clear();
+                                    usePrefetch = false;
+                                    break;
+                                }
+                                
+                                // Build chunk info
+                                exr_chunk_info_t ci;
+                                ci.idx = ti.chunkIdx;
+                                ci.type = (uint8_t)EXR_STORAGE_TILED;
+                                ci.compression = (uint8_t)compType;
+                                ci.start_x = ti.tx;
+                                ci.start_y = ti.ty;
+                                // Compute actual chunk width/height for edge tiles at this level.
+                                // levelPixelW/H are the level dimensions; tiles are indexed from 0.
+                                int32_t cx0 = (int32_t)ti.tx * levelTileW;
+                                int32_t cy0 = (int32_t)ti.ty * levelTileH;
+                                int32_t cwidth = levelTileW;
+                                int32_t cheight = levelTileH;
+                                if (cx0 + cwidth > levelPixelW) cwidth = levelPixelW - cx0;
+                                if (cy0 + cheight > levelPixelH) cheight = levelPixelH - cy0;
+                                if (cwidth <= 0 || cheight <= 0)
+                                {
+                                    allChunks.clear();
+                                    usePrefetch = false;
+                                    break;
+                                }
+                                ci.width = cwidth;
+                                ci.height = cheight;
+                                ci.level_x = (uint8_t)lx;
+                                ci.level_y = (uint8_t)ly;
+                                ci.packed_size = packed_size;
+                                ci.unpacked_size = maxUnpackedSize;
+                                ci.data_offset = ti.leaderOffset + leaderSize;
+                                ci.sample_count_data_offset = 0;
+                                ci.sample_count_table_size = 0;
+                                
+                                allChunks.push_back(ci);
+                                
+                                // Map data_offset to buffer position
+                                size_t dataBufferPos = bufferPos + leaderSize;
+                                
+                                g_prefetchBuffer.offsetMap[ci.data_offset] = {dataBufferPos, (size_t)packed_size};
+                                
+                                tilesInRow++;
+                            }
+                            
+                            if (usePrefetch && !allChunks.empty()) {
+                                g_prefetchBuffer.active = true;
+                            }
+                        }
+                    }
                 }
             }
-            
-            g_prefetchBuffer.active = true;
         }
+    }
+    
+    // Fallback: if batch read failed, collect chunks the traditional way
+    if (usePrefetch && allChunks.empty())
+    {
+        usePrefetch = false;
     }
     // ==================== END I/O MERGING ====================
 
@@ -1117,8 +1409,10 @@ void TiledInputFile::Data::readTiles (int dx1, int dx2, int dy1, int dy2, int lx
         if (usePrefetch && !allChunks.empty())
         {
             // Reuse collected chunk info
-            for (const auto& chunk : allChunks)
+            for (size_t i = 0; i < allChunks.size(); ++i)
             {
+                const auto& chunk = allChunks[i];
+                
                 tp.cinfo = chunk;
                 tp.run_decode (
                     *_ctxt,
@@ -1156,9 +1450,11 @@ void TiledInputFile::Data::readTiles (int dx1, int dx2, int dy1, int dy2, int lx
         }
     }
     
-    // Clean up prefetch state (keep buffer capacity for reuse)
+    // Clean up prefetch state - must happen AFTER all TileProcess objects are destroyed
+    // to ensure packed_buffer pointers are no longer used
     if (g_prefetchBuffer.active) {
         g_prefetchBuffer.active = false;
+        g_prefetchBuffer.offsetMap.clear();
     }
 }
 
@@ -1197,7 +1493,7 @@ void TileProcess::run_decode (
     int absX, absY, tileX, tileY;
     exr_attr_box2i_t dw;
     uint16_t prevFlags = 0;
-
+    
     // stash the flag off to make sure to clean up in the event
     // of an exception by changing the flag after init...
     bool isfirst = first;

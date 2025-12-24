@@ -588,11 +588,15 @@ unpack_half_to_float_3chan_interleave (exr_decode_pipeline_t* decode)
     const uint8_t*  srcbuffer = decode->unpacked_buffer;
     const uint16_t *in0, *in1, *in2;
     uint8_t*        out0;
-    int             w, h;
+    int             w, h, out_w, x_skip;
     int             linc0;
 
     w     = decode->channels[0].width;
     h     = decode->chunk.height - decode->user_line_end_ignore;
+    x_skip = decode->user_pixel_begin_skip;
+    out_w  = w - x_skip - decode->user_pixel_end_ignore;
+    if (out_w <= 0 || out_w > w) out_w = w;
+    if (x_skip < 0) x_skip = 0;
     linc0 = decode->channels[0].user_line_stride;
 
     out0 = decode->channels[0].decode_to_ptr;
@@ -608,12 +612,12 @@ unpack_half_to_float_3chan_interleave (exr_decode_pipeline_t* decode)
     {
         float* out = (float*) out0;
 
-        in0 = (const uint16_t*) srcbuffer;
-        in1 = in0 + w;
-        in2 = in1 + w;
+        in0 = (const uint16_t*) srcbuffer + x_skip;
+        in1 = (const uint16_t*) srcbuffer + w + x_skip;
+        in2 = (const uint16_t*) srcbuffer + w * 2 + x_skip;
 
         srcbuffer += w * 6; // 3 * sizeof(uint16_t), avoid type conversion
-        for (int x = 0; x < w; ++x)
+        for (int x = 0; x < out_w; ++x)
         {
             out[0] = half_to_float (one_to_native16 (in0[x]));
             out[1] = half_to_float (one_to_native16 (in1[x]));
@@ -634,11 +638,15 @@ unpack_half_to_float_3chan_interleave_rev (exr_decode_pipeline_t* decode)
     const uint8_t*  srcbuffer = decode->unpacked_buffer;
     const uint16_t *in0, *in1, *in2;
     uint8_t*        out0;
-    int             w, h;
+    int             w, h, out_w, x_skip;
     int             linc0;
 
     w     = decode->channels[0].width;
     h     = decode->chunk.height - decode->user_line_end_ignore;
+    x_skip = decode->user_pixel_begin_skip;
+    out_w  = w - x_skip - decode->user_pixel_end_ignore;
+    if (out_w <= 0 || out_w > w) out_w = w;
+    if (x_skip < 0) x_skip = 0;
     linc0 = decode->channels[0].user_line_stride;
 
     out0 = decode->channels[2].decode_to_ptr;
@@ -654,12 +662,12 @@ unpack_half_to_float_3chan_interleave_rev (exr_decode_pipeline_t* decode)
     {
         float* out = (float*) out0;
 
-        in0 = (const uint16_t*) srcbuffer;
-        in1 = in0 + w;
-        in2 = in1 + w;
+        in0 = (const uint16_t*) srcbuffer + x_skip;
+        in1 = (const uint16_t*) srcbuffer + w + x_skip;
+        in2 = (const uint16_t*) srcbuffer + w * 2 + x_skip;
 
         srcbuffer += w * 6; // 3 * sizeof(uint16_t), avoid type conversion
-        for (int x = 0; x < w; ++x)
+        for (int x = 0; x < out_w; ++x)
         {
             out[0] = half_to_float (one_to_native16 (in2[x]));
             out[1] = half_to_float (one_to_native16 (in1[x]));
@@ -974,11 +982,15 @@ unpack_half_to_float_4chan_interleave (exr_decode_pipeline_t* decode)
     const uint8_t*  srcbuffer = decode->unpacked_buffer;
     const uint16_t *in0, *in1, *in2, *in3;
     uint8_t*        out0;
-    int             w, h;
+    int             w, h, out_w, x_skip;
     int             linc0;
 
     w     = decode->channels[0].width;
     h     = decode->chunk.height - decode->user_line_end_ignore;
+    x_skip = decode->user_pixel_begin_skip;
+    out_w  = w - x_skip - decode->user_pixel_end_ignore;
+    if (out_w <= 0 || out_w > w) out_w = w;
+    if (x_skip < 0) x_skip = 0;
     linc0 = decode->channels[0].user_line_stride;
 
     out0 = decode->channels[0].decode_to_ptr;
@@ -993,13 +1005,13 @@ unpack_half_to_float_4chan_interleave (exr_decode_pipeline_t* decode)
     for (int y = decode->user_line_begin_skip; y < h; ++y)
     {
         float* out = (float*) out0;
-        in0        = (const uint16_t*) srcbuffer;
-        in1        = in0 + w;
-        in2        = in1 + w;
-        in3        = in2 + w;
+        in0        = (const uint16_t*) srcbuffer + x_skip;
+        in1        = (const uint16_t*) srcbuffer + w + x_skip;
+        in2        = (const uint16_t*) srcbuffer + w * 2 + x_skip;
+        in3        = (const uint16_t*) srcbuffer + w * 3 + x_skip;
 
         srcbuffer += w * 8; // 4 * sizeof(uint16_t), avoid type conversion
-        for (int x = 0; x < w; ++x)
+        for (int x = 0; x < out_w; ++x)
         {
             out[0] = half_to_float (one_to_native16 (in0[x]));
             out[1] = half_to_float (one_to_native16 (in1[x]));
@@ -1021,11 +1033,15 @@ unpack_half_to_float_4chan_interleave_rev (exr_decode_pipeline_t* decode)
     const uint8_t*  srcbuffer = decode->unpacked_buffer;
     const uint16_t *in0, *in1, *in2, *in3;
     uint8_t*        out0;
-    int             w, h;
+    int             w, h, out_w, x_skip;
     int             linc0;
 
     w     = decode->channels[0].width;
     h     = decode->chunk.height - decode->user_line_end_ignore;
+    x_skip = decode->user_pixel_begin_skip;
+    out_w  = w - x_skip - decode->user_pixel_end_ignore;
+    if (out_w <= 0 || out_w > w) out_w = w;
+    if (x_skip < 0) x_skip = 0;
     linc0 = decode->channels[0].user_line_stride;
 
     out0 = decode->channels[3].decode_to_ptr;
@@ -1040,13 +1056,13 @@ unpack_half_to_float_4chan_interleave_rev (exr_decode_pipeline_t* decode)
     for (int y = decode->user_line_begin_skip; y < h; ++y)
     {
         float* out = (float*) out0;
-        in0        = (const uint16_t*) srcbuffer;
-        in1        = in0 + w;
-        in2        = in1 + w;
-        in3        = in2 + w;
+        in0        = (const uint16_t*) srcbuffer + x_skip;
+        in1        = (const uint16_t*) srcbuffer + w + x_skip;
+        in2        = (const uint16_t*) srcbuffer + w * 2 + x_skip;
+        in3        = (const uint16_t*) srcbuffer + w * 3 + x_skip;
 
         srcbuffer += w * 8; // 4 * sizeof(uint16_t), avoid type conversion
-        for (int x = 0; x < w; ++x)
+        for (int x = 0; x < out_w; ++x)
         {
             out[0] = half_to_float (one_to_native16 (in3[x]));
             out[1] = half_to_float (one_to_native16 (in2[x]));
@@ -1336,6 +1352,11 @@ unpack_32bit (exr_decode_pipeline_t* decode)
     uint8_t*       cdata;
     int64_t        w, h, pixincrement;
     int            chans = decode->channel_count;
+    int32_t        x_skip = decode->user_pixel_begin_skip;
+    int32_t        x_end  = decode->user_pixel_end_ignore;
+
+    if (x_skip < 0) x_skip = 0;
+    if (x_end < 0) x_end = 0;
 
     h = (int64_t) decode->chunk.height - decode->user_line_end_ignore;
     /*
@@ -1359,21 +1380,24 @@ unpack_32bit (exr_decode_pipeline_t* decode)
             w            = decc->width;
             pixincrement = decc->user_pixel_stride;
             cdata += y * (int64_t) decc->user_line_stride;
+            int64_t out_w = w - (int64_t) x_skip - (int64_t) x_end;
+            if (out_w <= 0 || out_w > w) out_w = w;
+            const uint8_t* srcline = srcbuffer + ((size_t) x_skip) * 4;
             /* specialize to memcpy if we can */
 #if EXR_HOST_IS_NOT_LITTLE_ENDIAN
             if (pixincrement == 4)
             {
                 uint32_t*       tmp = (uint32_t*) cdata;
-                const uint32_t* src = (const uint32_t*) srcbuffer;
-                uint32_t*       end = tmp + w;
+                const uint32_t* src = (const uint32_t*) srcline;
+                uint32_t*       end = tmp + (uint32_t) out_w;
 
                 while (tmp < end)
                     *tmp++ = le32toh (*src++);
             }
             else
             {
-                const uint32_t* src = (const uint32_t*) srcbuffer;
-                for (int64_t x = 0; x < w; ++x)
+                const uint32_t* src = (const uint32_t*) srcline;
+                for (int64_t x = 0; x < out_w; ++x)
                 {
                     *((uint32_t*) cdata) = le32toh (*src++);
                     cdata += pixincrement;
@@ -1382,12 +1406,12 @@ unpack_32bit (exr_decode_pipeline_t* decode)
 #else
             if (pixincrement == 4)
             {
-                memcpy (cdata, srcbuffer, (size_t) (w) * 4);
+                memcpy (cdata, srcline, (size_t) (out_w) * 4);
             }
             else
             {
-                const uint32_t* src = (const uint32_t*) srcbuffer;
-                for (int64_t x = 0; x < w; ++x)
+                const uint32_t* src = (const uint32_t*) srcline;
+                for (int64_t x = 0; x < out_w; ++x)
                 {
                     *((uint32_t*) cdata) = *src++;
                     cdata += pixincrement;
@@ -1553,6 +1577,11 @@ generic_unpack (exr_decode_pipeline_t* decode)
     const uint8_t* srcbuffer = decode->unpacked_buffer;
     uint8_t*       cdata;
     int            w, h, bpc, ubpc, uls;
+    int32_t        x_skip = decode->user_pixel_begin_skip;
+    int32_t        x_end  = decode->user_pixel_end_ignore;
+
+    if (x_skip < 0) x_skip = 0;
+    if (x_end < 0) x_end = 0;
 
     uls = decode->user_line_begin_skip;
     h = decode->chunk.height - decode->user_line_end_ignore;
@@ -1600,8 +1629,30 @@ generic_unpack (exr_decode_pipeline_t* decode)
                 cdata += ((uint64_t) (y - uls)) * ((uint64_t) decc->user_line_stride);
             }
 
-            UNPACK_SAMPLES (w)
-            srcbuffer += w * bpc;
+            {
+                int xs = x_skip;
+                if (xs > w) xs = 0;
+                int out_w = w - xs - x_end;
+                if (out_w <= 0 || out_w > w)
+                {
+                    out_w = w;
+                    xs    = 0;
+                }
+
+                const uint8_t* full_line = srcbuffer;
+                if (xs != 0 || out_w != w)
+                {
+                    const uint8_t* saved = srcbuffer;
+                    srcbuffer            = full_line + ((size_t) xs) * ((size_t) bpc);
+                    UNPACK_SAMPLES (out_w)
+                    srcbuffer = saved;
+                }
+                else
+                {
+                    UNPACK_SAMPLES (w)
+                }
+                srcbuffer = full_line + ((size_t) w) * ((size_t) bpc);
+            }
         }
     }
     return EXR_ERR_SUCCESS;

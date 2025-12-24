@@ -282,9 +282,20 @@ PyFile::PyFile(const std::string& filename, bool separate_channels, bool header_
             //
         
             auto type = header.type();
-            if (type == SCANLINEIMAGE || type == TILEDIMAGE)
+            if (type == SCANLINEIMAGE)
             {
                 P.readPixels(*_inputFile, header.channels(), shape, rgbaChannels, dw, separate_channels);
+            }
+            else if (type == TILEDIMAGE)
+            {
+                // Temporarily disable IOMerge during full file read to avoid issues
+                // IOMerge is optimized for partial reads, not full file reads
+                bool wasIOMergeEnabled = Imf::isMergeEnabled();
+                if (wasIOMergeEnabled) Imf::setIOMerge(false);
+                
+                P.readTiledPixels(*_inputFile, header, shape, rgbaChannels, dw, separate_channels);
+                
+                if (wasIOMergeEnabled) Imf::setIOMerge(true);
             }
             else if (type == DEEPSCANLINE || type == DEEPTILE)
             {
@@ -506,6 +517,108 @@ PyPart::readPixels(MultiPartInputFile& infile, const ChannelList& channel_list,
 
     part.setFrameBuffer (frameBuffer);
     part.readPixels (dw.min.y, dw.max.y);
+}
+
+void
+PyPart::readTiledPixels(MultiPartInputFile& infile, const Header& header,
+                        const std::vector<size_t>& shape, const std::set<std::string>& rgbaChannels,
+                        const Box2i& dw, bool separate_channels)
+{
+    const ChannelList& channel_list = header.channels();
+    FrameBuffer frameBuffer;
+
+    for (auto c = channel_list.begin(); c != channel_list.end(); c++)
+    {
+        std::string py_channel_name = c.name();
+        char channel_name; 
+        int nrgba = 0;
+        if (!separate_channels)
+            nrgba = channelNameToRGBA(channel_list, c.name(), py_channel_name, channel_name);
+            
+        auto py_channel_name_str = py::str(py_channel_name);
+            
+        if (!channels.contains(py_channel_name_str))
+        {
+            PyChannel C;
+
+            C.name = py_channel_name;
+            C.xSampling = c.channel().xSampling;
+            C.ySampling = c.channel().ySampling;
+            C.pLinear = c.channel().pLinear;
+                
+            const auto style = py::array::c_style | py::array::forcecast;
+
+            std::vector<size_t> c_shape = shape;
+
+            if (rgbaChannels.find(c.name()) != rgbaChannels.end())
+                c_shape.push_back(nrgba);
+
+            switch (c.channel().type)
+            {
+              case UINT:
+                  C.pixels = py::array_t<uint32_t,style>(c_shape);
+                  break;
+              case HALF:
+                  C.pixels = py::array_t<half,style>(c_shape);
+                  break;
+              case FLOAT:
+                  C.pixels = py::array_t<float,style>(c_shape);
+                  break;
+              default:
+                  throw std::runtime_error("invalid pixel type");
+            }
+
+            channels[py_channel_name.c_str()] = C;
+        }
+
+        auto v = channels[py_channel_name.c_str()];
+        auto C = v.cast<PyChannel&>();
+
+        py::buffer_info buf = C.pixels.request();
+        auto basePtr = static_cast<uint8_t*>(buf.ptr);
+
+        py::dtype dt = C.pixels.dtype();
+        size_t xStride = dt.itemsize();
+        if (nrgba > 0)
+        {
+            xStride *= nrgba;
+            switch (channel_name)
+            {
+              case 'R':
+                  break;
+              case 'G':
+                  basePtr += dt.itemsize();
+                  break;
+              case 'B':
+                  basePtr += 2 * dt.itemsize();
+                  break;
+              case 'A':
+                  basePtr += 3 * dt.itemsize();
+                  break;
+              default:
+                  break;
+            }
+        }
+
+        size_t yStride = xStride * shape[1] / C.xSampling;
+
+        frameBuffer.insert (c.name(),
+                            Slice::Make (c.channel().type,
+                                         (void*) basePtr,
+                                         dw, xStride, yStride,
+                                         C.xSampling,
+                                         C.ySampling));
+    }
+
+    // Use TiledInputPart for tiled files
+    TiledInputPart part (infile, part_index);
+
+    part.setFrameBuffer (frameBuffer);
+    
+    // Read all tiles
+    int numXTiles = part.numXTiles (0);
+    int numYTiles = part.numYTiles (0);
+    part.readTiles (0, numXTiles - 1, 0, numYTiles - 1);
 }
 
 void

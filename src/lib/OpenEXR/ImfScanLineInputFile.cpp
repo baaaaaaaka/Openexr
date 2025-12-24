@@ -28,6 +28,8 @@
 #include <cstring>
 #include <atomic>
 
+#include "openexr_part.h"
+
 #ifndef _WIN32
 #include <fcntl.h>
 #include <unistd.h>
@@ -569,74 +571,177 @@ void ScanLineInputFile::Data::readPixels (
     nchunks += 1;
     
     bool usePrefetch = g_enableIOMerge.load(std::memory_order_relaxed) && nchunks > 1;
-    std::vector<exr_chunk_info_t> allChunks;  // Reused if prefetch enabled
+    std::vector<exr_chunk_info_t> allChunks;
     
     if (usePrefetch)
     {
-        // Phase 1: Collect all chunk info (reused in decode loop for multi-threaded)
-        allChunks.reserve(nchunks);
-        std::vector<std::pair<uint64_t, uint64_t>> ioRanges;
-        ioRanges.reserve(nchunks);
-        
-        for (int y = scanLine1; y <= scanLine2; )
-        {
-            exr_chunk_info_t chunk;
-            if (EXR_ERR_SUCCESS != exr_read_scanline_chunk_info (*_ctxt, partNumber, y, &chunk))
-                throw IEX_NAMESPACE::InputExc ("Unable to query scanline information");
-            
-            allChunks.push_back(chunk);
-            ioRanges.push_back({chunk.data_offset, chunk.packed_size});
-            
-            y += scansperchunk - (y - chunk.start_y);
-        }
-        
-        // Phase 2: Merge adjacent ranges and calculate total size
-        auto mergedRanges = mergeScanlineIOranges(ioRanges, 4096);
-        
-        size_t totalSize = 0;
-        for (const auto& r : mergedRanges) {
-            totalSize += r.second;
-        }
-        
-        g_scanlinePrefetchBuffer.data.resize(totalSize);
-        g_scanlinePrefetchBuffer.offsetMap.clear();
-        g_scanlinePrefetchBuffer.offsetMap.reserve(nchunks);
-        
-        // Phase 3: Read merged ranges (single file open)
         const char* filename = _ctxt->fileName();
         if (!filename || filename[0] == '\0') {
             usePrefetch = false;
-            allChunks.clear();
         }
         else
         {
-            if (!scanlineReadMultipleRanges(filename, mergedRanges, g_scanlinePrefetchBuffer.data.data())) {
-                throw IEX_NAMESPACE::IoExc ("Failed to prefetch scanline data");
-            }
+            // Get chunk offset table (already in memory, no I/O)
+            uint64_t* chunkTable = nullptr;
+            int32_t chunkCount = 0;
+            exr_result_t rv = exr_get_chunk_table(*_ctxt, partNumber, &chunkTable, &chunkCount);
             
-            // Build offset map with single pass
-            std::vector<std::pair<uint64_t, size_t>> rangeStartToBufferPos;
-            rangeStartToBufferPos.reserve(mergedRanges.size());
-            size_t bufferPos = 0;
-            for (const auto& r : mergedRanges) {
-                rangeStartToBufferPos.push_back({r.first, bufferPos});
-                bufferPos += r.second;
+            // Get data window
+            exr_attr_box2i_t dw;
+            if (EXR_ERR_SUCCESS != exr_get_data_window(*_ctxt, partNumber, &dw)) {
+                usePrefetch = false;
             }
-            
-            for (const auto& chunk : allChunks) {
-                auto it = std::upper_bound(rangeStartToBufferPos.begin(), rangeStartToBufferPos.end(),
-                                          std::make_pair(chunk.data_offset, SIZE_MAX));
-                if (it != rangeStartToBufferPos.begin()) {
-                    --it;
-                    g_scanlinePrefetchBuffer.offsetMap[chunk.data_offset] = {
-                        it->second + (chunk.data_offset - it->first),
-                        chunk.packed_size
-                    };
+            else if (rv != EXR_ERR_SUCCESS || !chunkTable) {
+                usePrefetch = false;
+            }
+            else
+            {
+                // Calculate chunk indices for the scanline range
+                // Scanline chunk index = (y - dw.min.y) / scansperchunk
+                struct ScanlineChunkInfo {
+                    int startY;
+                    int32_t chunkIdx;
+                    uint64_t leaderOffset;
+                };
+                std::vector<ScanlineChunkInfo> chunkInfos;
+                chunkInfos.reserve(nchunks);
+                
+                uint64_t minLeaderOffset = UINT64_MAX;
+                uint64_t maxLeaderOffset = 0;
+                
+                for (int y = scanLine1; y <= scanLine2; ) {
+                    ScanlineChunkInfo sci;
+                    sci.startY = y;
+                    sci.chunkIdx = (y - dw.min.y) / scansperchunk;
+                    
+                    if (sci.chunkIdx >= 0 && sci.chunkIdx < chunkCount) {
+                        sci.leaderOffset = chunkTable[sci.chunkIdx];
+                        if (sci.leaderOffset > 0) {
+                            minLeaderOffset = std::min(minLeaderOffset, sci.leaderOffset);
+                            maxLeaderOffset = std::max(maxLeaderOffset, sci.leaderOffset);
+                            chunkInfos.push_back(sci);
+                        }
+                    }
+                    y += scansperchunk;  // Move to next chunk
+                }
+                
+                if (chunkInfos.empty()) {
+                    usePrefetch = false;
+                }
+                else
+                {
+                    // Get compression type
+                    exr_compression_t compType;
+                    if (EXR_ERR_SUCCESS != exr_get_compression(*_ctxt, partNumber, &compType)) {
+                        usePrefetch = false;
+                    }
+                    else
+                    {
+                        // Leader size for scanline: 8 bytes (y + packed_size) or 12 for multipart
+                        size_t leaderSize = 8;
+                        
+                        // Estimate max data: width * scansperchunk * channels * sizeof(half)
+                        int width = dw.max.x - dw.min.x + 1;
+                        size_t maxPackedSizeEstimate = width * scansperchunk * 3 * 2;
+                        
+                        // Calculate total range to read
+                        size_t totalRangeSize = (maxLeaderOffset - minLeaderOffset) + leaderSize + maxPackedSizeEstimate;
+                        
+                        // Read entire range in one I/O
+                        g_scanlinePrefetchBuffer.data.resize(totalRangeSize);
+                        
+                        std::vector<std::pair<uint64_t, uint64_t>> rangeToRead = {
+                            {minLeaderOffset, totalRangeSize}
+                        };
+                        
+                        if (!scanlineReadMultipleRanges(filename, rangeToRead, g_scanlinePrefetchBuffer.data.data())) {
+                            usePrefetch = false;
+                        }
+                        else
+                        {
+                            allChunks.reserve(nchunks);
+                            g_scanlinePrefetchBuffer.offsetMap.clear();
+                            g_scanlinePrefetchBuffer.offsetMap.reserve(nchunks);
+                            
+                            uint64_t actualMaxDataEnd = 0;
+                            
+                            for (const auto& sci : chunkInfos) {
+                                size_t bufferPos = sci.leaderOffset - minLeaderOffset;
+                                
+                                // Parse leader: [y][packed_size] (each int32)
+                                int32_t* leader = reinterpret_cast<int32_t*>(g_scanlinePrefetchBuffer.data.data() + bufferPos);
+                                
+                                int32_t ldr_y = leader[0];
+                                int32_t packed_size = leader[1];
+                                
+                                // Validate
+                                if (packed_size <= 0 || packed_size > (int32_t)(width * scansperchunk * 6)) {
+                                    allChunks.clear();
+                                    usePrefetch = false;
+                                    break;
+                                }
+                                
+                                // Build chunk info
+                                exr_chunk_info_t ci;
+                                ci.idx = sci.chunkIdx;
+                                ci.type = (uint8_t)EXR_STORAGE_SCANLINE;
+                                ci.compression = (uint8_t)compType;
+                                ci.start_x = dw.min.x;
+                                ci.start_y = ldr_y;
+                                ci.width = width;
+                                // Last scanline chunk may be shorter than scansperchunk
+                                int32_t chunkH = scansperchunk;
+                                int32_t remaining = (int32_t)dw.max.y - ldr_y + 1;
+                                if (remaining < chunkH) chunkH = remaining;
+                                if (chunkH < 0) chunkH = 0;
+                                ci.height = chunkH;
+                                ci.level_x = 0;
+                                ci.level_y = 0;
+                                ci.packed_size = packed_size;
+                                // Conservative: keep part-level max if available, but at least bound by chunkH
+                                ci.unpacked_size = (uint64_t)width * (uint64_t)std::max<int32_t>(chunkH, 0) * 6;
+                                ci.data_offset = sci.leaderOffset + leaderSize;
+                                ci.sample_count_data_offset = 0;
+                                ci.sample_count_table_size = 0;
+                                
+                                allChunks.push_back(ci);
+                                
+                                uint64_t dataEnd = ci.data_offset + packed_size;
+                                if (dataEnd > actualMaxDataEnd) actualMaxDataEnd = dataEnd;
+                                
+                                size_t dataBufferPos = ci.data_offset - minLeaderOffset;
+                                g_scanlinePrefetchBuffer.offsetMap[ci.data_offset] = {dataBufferPos, (size_t)packed_size};
+                            }
+                            
+                            if (usePrefetch && !allChunks.empty())
+                            {
+                                // Extend buffer if needed
+                                if (actualMaxDataEnd > minLeaderOffset + totalRangeSize) {
+                                    size_t extraNeeded = actualMaxDataEnd - (minLeaderOffset + totalRangeSize);
+                                    size_t oldSize = g_scanlinePrefetchBuffer.data.size();
+                                    g_scanlinePrefetchBuffer.data.resize(oldSize + extraNeeded);
+                                    
+                                    std::vector<std::pair<uint64_t, uint64_t>> extraRange = {
+                                        {minLeaderOffset + totalRangeSize, extraNeeded}
+                                    };
+                                    if (!scanlineReadMultipleRanges(filename, extraRange,
+                                            g_scanlinePrefetchBuffer.data.data() + oldSize)) {
+                                        throw IEX_NAMESPACE::IoExc("Failed to prefetch remaining scanline data");
+                                    }
+                                }
+                                
+                                g_scanlinePrefetchBuffer.active = true;
+                            }
+                        }
+                    }
                 }
             }
-            
-            g_scanlinePrefetchBuffer.active = true;
         }
+    }
+    
+    // Fallback if batch read failed
+    if (usePrefetch && allChunks.empty()) {
+        usePrefetch = false;
     }
     // ==================== END I/O MERGING ====================
 
@@ -681,18 +786,36 @@ void ScanLineInputFile::Data::readPixels (
     {
         std::unique_ptr<ScanLineProcess> sp = checkoutScan ();
 
-        for (int y = scanLine1; y <= scanLine2; )
+        if (usePrefetch && !allChunks.empty())
         {
-            if (EXR_ERR_SUCCESS != exr_read_scanline_chunk_info (*_ctxt, partNumber, y, &cinfo))
-                throw IEX_NAMESPACE::InputExc ("Unable to query scanline information");
-
-            // check if we have the same chunk where we can just
-            // re-run the unpack (i.e. people reading 1 scan at a time
-            // in a multi-scanline chunk)
-            if (!sp->first && sp->cinfo.idx == cinfo.idx &&
-                sp->last_decode_err == EXR_ERR_SUCCESS)
+            // Use prefetched chunk info
+            for (const auto& chunk : allChunks)
             {
-                sp->run_unpack (
+                sp->cinfo = chunk;
+                sp->run_decode (
+                    *_ctxt,
+                    partNumber,
+                    &fb,
+                    chunk.start_y,
+                    scanLine2,
+                    fill_list);
+            }
+        }
+        else
+        {
+            // Fallback to original behavior
+            for (int y = scanLine1; y <= scanLine2; )
+            {
+                if (EXR_ERR_SUCCESS != exr_read_scanline_chunk_info (*_ctxt, partNumber, y, &cinfo))
+                    throw IEX_NAMESPACE::InputExc ("Unable to query scanline information");
+
+                // check if we have the same chunk where we can just
+                // re-run the unpack (i.e. people reading 1 scan at a time
+                // in a multi-scanline chunk)
+                if (!sp->first && sp->cinfo.idx == cinfo.idx &&
+                    sp->last_decode_err == EXR_ERR_SUCCESS)
+                {
+                    sp->run_unpack (
                     *_ctxt,
                     partNumber,
                     &fb,
@@ -712,7 +835,8 @@ void ScanLineInputFile::Data::readPixels (
                     fill_list);
             }
 
-            y += scansperchunk - (y - cinfo.start_y);
+                y += scansperchunk - (y - cinfo.start_y);
+            }
         }
 
         checkinScan (sp);

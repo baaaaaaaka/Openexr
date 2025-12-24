@@ -155,6 +155,9 @@ class PyPart
     void           readPixels(MultiPartInputFile& infile, const ChannelList& channel_list,
                               const std::vector<size_t>& shape, const std::set<std::string>& rgbaChannels,
                               const Box2i& dw, bool separate_channels);
+    void           readTiledPixels(MultiPartInputFile& infile, const Header& header,
+                                   const std::vector<size_t>& shape, const std::set<std::string>& rgbaChannels,
+                                   const Box2i& dw, bool separate_channels);
     void           readDeepPixels(MultiPartInputFile& infile, const std::string& type, const ChannelList& channel_list,
                                   const std::vector<size_t>& shape, const std::set<std::string>& rgbaChannels,
                                   const Box2i& dw, bool separate_channels);
