@@ -2316,8 +2316,14 @@ PyFile::readRegionToBuffer(int xMin, int yMin, int xMax, int yMax,
         InputPart part(*_inputFile, part_index);
         
         if (!needsXCrop) {
-            // FAST PATH: Full width, write directly to output
+            // FAST PATH: Full width, write directly to output (zero-copy)
             // OpenEXR supports automatic type conversion (HALF→FLOAT, UINT→FLOAT)
+            // 
+            // Note: Slice::Make calculates base = ptr - origin.y * yStride
+            // When origin.y = yMin (from regionBox), and OpenEXR's run_decode uses
+            // fbY = max(chunk.start_y, scanLine1), the decode_to_ptr calculation:
+            //   ptr = base + fbY * yStride = (basePtr - yMin * yStride) + fbY * yStride
+            // will be >= basePtr (since fbY >= yMin), so no underflow occurs.
             Box2i regionBox(V2i(dw.min.x, yMin), V2i(dw.max.x, yMaxInclusive));
             FrameBuffer frameBuffer;
             
@@ -2336,67 +2342,64 @@ PyFile::readRegionToBuffer(int xMin, int yMin, int xMax, int yMax,
         }
         
         // X-CROP PATH: Read full width, copy with crop
+        // 
+        // IMPORTANT: OpenEXR decompresses entire chunks (e.g., 32 scanlines for PIZ),
+        // not just the requested range. So when we call readPixels(y1, y2), OpenEXR
+        // may write to scanlines outside [y1, y2] within the same chunk.
+        // 
+        // Solution: Allocate a buffer covering the full dataWindow height, so any
+        // Y coordinate is valid. This avoids complex chunk boundary calculations.
         {
-            const size_t TARGET_CACHE_BYTES = 4 * 1024 * 1024;
-            size_t bytesPerScanline = fullWidth * sizeof(float);
-            size_t chunkHeight = std::max(size_t(1), TARGET_CACHE_BYTES / bytesPerScanline);
-            chunkHeight = std::min(chunkHeight, regionHeight);
-            if (chunkHeight >= 16) chunkHeight = (chunkHeight / 16) * 16;
+            size_t imageHeight = static_cast<size_t>(dw.max.y - dw.min.y + 1);
             
             std::map<std::string, std::vector<float>> chunkBuffers;
             for (const auto& m : mappings) {
-                chunkBuffers[m.exr_name].resize(fullWidth * chunkHeight);
+                chunkBuffers[m.exr_name].resize(fullWidth * imageHeight);
             }
             
-            for (size_t chunkStart = 0; chunkStart < regionHeight; chunkStart += chunkHeight)
-            {
-                size_t currentChunkHeight = std::min(chunkHeight, regionHeight - chunkStart);
-                int readYMin = yMin + static_cast<int>(chunkStart);
-                int readYMax = readYMin + static_cast<int>(currentChunkHeight) - 1;
+            // Create FrameBuffer covering entire image
+            Box2i fullBox(V2i(dw.min.x, dw.min.y), V2i(dw.max.x, dw.max.y));
+            FrameBuffer frameBuffer;
+            for (const auto& m : mappings) {
+                float* bufPtr = chunkBuffers[m.exr_name].data();
+                frameBuffer.insert(m.exr_name,
+                    Slice::Make(FLOAT, bufPtr, fullBox,
+                               sizeof(float), sizeof(float) * fullWidth,
+                               1, 1));
+            }
+            
+            part.setFrameBuffer(frameBuffer);
+            part.readPixels(yMin, yMaxInclusive);
+            
+            // Copy with X crop from the portion we actually need
+            bool useNT = Imf::nonTemporalWrites();
+            
+            for (const auto& m : mappings) {
+                const float* srcBuf = chunkBuffers[m.exr_name].data();
+                float* dst_c = out_ptr + m.out_idx * stride_c;
                 
-                Box2i chunkBox(V2i(dw.min.x, readYMin), V2i(dw.max.x, readYMax));
+                // Calculate source offset in the full-height buffer
+                size_t srcYOffset = static_cast<size_t>(yMin - dw.min.y);
                 
-                FrameBuffer frameBuffer;
-                for (const auto& m : mappings) {
-                    float* bufPtr = chunkBuffers[m.exr_name].data();
-                    frameBuffer.insert(m.exr_name,
-                        Slice::Make(FLOAT, bufPtr, chunkBox,
-                                   sizeof(float), sizeof(float) * fullWidth,
-                                   1, 1));
-                }
-                
-                part.setFrameBuffer(frameBuffer);
-                part.readPixels(readYMin, readYMax);
-                
-                // Copy with X crop (data still in cache)
-                // Use NT writes if enabled (keeps chunkBuffer in L2)
-                bool useNT = Imf::nonTemporalWrites();
-                
-                for (const auto& m : mappings) {
-                    const float* srcBuf = chunkBuffers[m.exr_name].data();
-                    float* dst_c = out_ptr + m.out_idx * stride_c;
+                for (size_t y = 0; y < regionHeight; ++y) {
+                    const float* srcRow = srcBuf + (srcYOffset + y) * fullWidth + offsetX;
+                    float* dstRow = dst_c + y * stride_y;
                     
-                    for (size_t y = 0; y < currentChunkHeight; ++y) {
-                        const float* srcRow = srcBuf + y * fullWidth + offsetX;
-                        float* dstRow = dst_c + (chunkStart + y) * stride_y;
-                        
-                        if (stride_x == 1) {
-                            if (useNT) {
-                                memcpy_nt_float(dstRow, srcRow, regionWidth);
-                            } else {
-                                std::memcpy(dstRow, srcRow, regionWidth * sizeof(float));
-                            }
+                    if (stride_x == 1) {
+                        if (useNT) {
+                            memcpy_nt_float(dstRow, srcRow, regionWidth);
                         } else {
-                            for (size_t x = 0; x < regionWidth; ++x) {
-                                dstRow[x * stride_x] = srcRow[x];
-                            }
+                            std::memcpy(dstRow, srcRow, regionWidth * sizeof(float));
+                        }
+                    } else {
+                        for (size_t x = 0; x < regionWidth; ++x) {
+                            dstRow[x * stride_x] = srcRow[x];
                         }
                     }
                 }
             }
-            
-            return channels_written;
-        }
+        } // chunkBuffers scope ends here
+        return channels_written;
     }
     
 fallback_path:

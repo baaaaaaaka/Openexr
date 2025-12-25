@@ -1452,6 +1452,7 @@ void TiledInputFile::Data::readTiles (int dx1, int dx2, int dy1, int dy2, int lx
                                 int32_t cheight = levelTileH;
                                 if (cx0 + cwidth > levelPixelW) cwidth = levelPixelW - cx0;
                                 if (cy0 + cheight > levelPixelH) cheight = levelPixelH - cy0;
+                                
                                 if (cwidth <= 0 || cheight <= 0)
                                 {
                                     allChunks.clear();
@@ -1463,7 +1464,21 @@ void TiledInputFile::Data::readTiles (int dx1, int dx2, int dy1, int dy2, int lx
                                 ci.level_x = (uint8_t)lx;
                                 ci.level_y = (uint8_t)ly;
                                 ci.packed_size = packed_size;
-                                ci.unpacked_size = maxUnpackedSize;
+                                
+                                // Compute unpacked_size based on actual chunk dimensions.
+                                // For edge tiles, this will be smaller than maxUnpackedSize.
+                                // unpacked_size = width * height * bytes_per_pixel * num_channels
+                                // We need to query channel info to get the correct size.
+                                // For now, use the formula: (levelTileW is base, actual is cwidth x cheight)
+                                // Ratio approach: unpacked = maxUnpackedSize * (cwidth*cheight) / (levelTileW*levelTileH)
+                                if (cwidth == levelTileW && cheight == levelTileH) {
+                                    ci.unpacked_size = maxUnpackedSize;
+                                } else {
+                                    // Scale by actual size ratio
+                                    uint64_t fullTilePixels = (uint64_t)levelTileW * (uint64_t)levelTileH;
+                                    uint64_t actualPixels = (uint64_t)cwidth * (uint64_t)cheight;
+                                    ci.unpacked_size = (maxUnpackedSize * actualPixels) / fullTilePixels;
+                                }
                                 ci.data_offset = ti.leaderOffset + leaderSize;
                                 ci.sample_count_data_offset = 0;
                                 ci.sample_count_table_size = 0;
@@ -1630,20 +1645,32 @@ void TileProcess::run_decode (
     // stash the flag off to make sure to clean up in the event
     // of an exception by changing the flag after init...
     bool isfirst = first;
-    if (first)
+    
+    // Check if chunk dimensions changed - if so, need to re-initialize decoder
+    // because exr_decoding_update may not handle size changes correctly
+    bool needReinit = !first && 
+        (decoder.chunk.width != cinfo.width || decoder.chunk.height != cinfo.height);
+    
+    if (needReinit) {
+        // Destroy old decoder and reinitialize for different chunk dimensions
+        exr_decoding_destroy (ctxt, &decoder);
+        isfirst = true;
+    }
+    
+    if (first || needReinit)
     {
-        if (EXR_ERR_SUCCESS !=
-            exr_decoding_initialize (ctxt, pn, &cinfo, &decoder))
+        exr_result_t rv = exr_decoding_initialize (ctxt, pn, &cinfo, &decoder);
+        if (EXR_ERR_SUCCESS != rv)
         {
             throw IEX_NAMESPACE::IoExc ("Unable to initialize decode pipeline");
         }
-
+        
         first = false;
     }
     else
     {
-        if (EXR_ERR_SUCCESS !=
-            exr_decoding_update (ctxt, pn, &cinfo, &decoder))
+        exr_result_t rv = exr_decoding_update (ctxt, pn, &cinfo, &decoder);
+        if (EXR_ERR_SUCCESS != rv)
         {
             throw IEX_NAMESPACE::IoExc ("Unable to update decode pipeline");
         }
@@ -1695,8 +1722,10 @@ void TileProcess::run_decode (
         }
     }
 
-    if (EXR_ERR_SUCCESS != exr_decoding_run (ctxt, pn, &decoder))
+    exr_result_t decode_result = exr_decoding_run (ctxt, pn, &decoder);
+    if (EXR_ERR_SUCCESS != decode_result) {
         throw IEX_NAMESPACE::IoExc ("Unable to run decoder");
+    }
 
     run_fill (outfb, dw.min.x, dw.min.y, absX, absY, filllist);
 }

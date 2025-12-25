@@ -64,10 +64,18 @@ scanline_prefetched_read_chunk(exr_decode_pipeline_t* decode)
     }
     
     size_t bufferPos = it->second.first;
+    size_t packed_size = decode->chunk.packed_size;
+    
+    // Validate buffer bounds
+    if (bufferPos + packed_size > g_scanlinePrefetchBuffer.data.size()) {
+        return EXR_ERR_OUT_OF_MEMORY;
+    }
     
     // Zero-copy: point directly to prefetch buffer
-    if (decode->packed_buffer && decode->packed_alloc_size > 0 && decode->free_fn) {
-        decode->free_fn(EXR_TRANSCODE_BUFFER_PACKED, decode->packed_buffer);
+    // Free any previously allocated buffer
+    if (decode->packed_buffer && decode->packed_alloc_size > 0) {
+        if (decode->free_fn)
+            decode->free_fn(EXR_TRANSCODE_BUFFER_PACKED, decode->packed_buffer);
     }
     
     decode->packed_buffer = g_scanlinePrefetchBuffer.data.data() + bufferPos;
@@ -252,8 +260,9 @@ struct ScanLineProcess
 {
     ~ScanLineProcess ()
     {
-        if (!first)
+        if (!first) {
             exr_decoding_destroy (decoder.context, &decoder);
+        }
     }
 
     void run_decode (
@@ -331,9 +340,11 @@ struct ScanLineInputFile::Data
 #if ILMTHREAD_THREADING_ENABLED
         std::lock_guard<std::mutex> lock (_mx);
 #endif
-        if (singleScan)
+        if (singleScan) {
             return std::move (singleScan);
-        return std::make_unique<ScanLineProcess> ();
+        }
+        auto newScan = std::make_unique<ScanLineProcess> ();
+        return newScan;
     }
     void checkinScan (std::unique_ptr<ScanLineProcess> &sp)
     {
@@ -660,9 +671,18 @@ void ScanLineInputFile::Data::readPixels (
     }
 
     // ==================== I/O MERGING FOR SCANLINES ====================
-    int64_t nchunks = ((int64_t) scanLine2 - (int64_t) scanLine1);
-    nchunks /= (int64_t) scansperchunk;
-    nchunks += 1;
+    // Clear any previous prefetch state to avoid cross-call contamination
+    // NOTE: Do NOT deallocate g_scanlinePrefetchBuffer.data here because
+    // previous decode operations may have stored pointers into it (packed_buffer).
+    // The vector will be resized as needed for the next prefetch operation.
+    g_scanlinePrefetchBuffer.active = false;
+    g_scanlinePrefetchBuffer.offsetMap.clear();
+
+    // Calculate first and last chunk indices correctly
+    // Chunk index = (y - minY) / scansperchunk
+    int firstChunk = (scanLine1 - dw.min.y) / scansperchunk;
+    int lastChunk = (scanLine2 - dw.min.y) / scansperchunk;
+    int64_t nchunks = lastChunk - firstChunk + 1;
     
     bool usePrefetch = g_enableIOMerge.load(std::memory_order_relaxed) && nchunks > 1;
     std::vector<exr_chunk_info_t> allChunks;
@@ -703,20 +723,23 @@ void ScanLineInputFile::Data::readPixels (
                 uint64_t minLeaderOffset = UINT64_MAX;
                 uint64_t maxLeaderOffset = 0;
                 
-                for (int y = scanLine1; y <= scanLine2; ) {
+                // Iterate through all chunks from firstChunk to lastChunk
+                int firstChunkLocal = (scanLine1 - dw.min.y) / scansperchunk;
+                int lastChunkLocal = (scanLine2 - dw.min.y) / scansperchunk;
+                
+                for (int chunkIdx = firstChunkLocal; chunkIdx <= lastChunkLocal; ++chunkIdx) {
                     ScanlineChunkInfo sci;
-                    sci.startY = y;
-                    sci.chunkIdx = (y - dw.min.y) / scansperchunk;
+                    sci.startY = dw.min.y + chunkIdx * scansperchunk;
+                    sci.chunkIdx = chunkIdx;
                     
-                    if (sci.chunkIdx >= 0 && sci.chunkIdx < chunkCount) {
-                        sci.leaderOffset = chunkTable[sci.chunkIdx];
+                    if (chunkIdx >= 0 && chunkIdx < chunkCount) {
+                        sci.leaderOffset = chunkTable[chunkIdx];
                         if (sci.leaderOffset > 0) {
                             minLeaderOffset = std::min(minLeaderOffset, sci.leaderOffset);
                             maxLeaderOffset = std::max(maxLeaderOffset, sci.leaderOffset);
                             chunkInfos.push_back(sci);
                         }
                     }
-                    y += scansperchunk;  // Move to next chunk
                 }
                 
                 if (chunkInfos.empty()) {
@@ -734,9 +757,13 @@ void ScanLineInputFile::Data::readPixels (
                         // Leader size for scanline: 8 bytes (y + packed_size) or 12 for multipart
                         size_t leaderSize = 8;
                         
-                        // Estimate max data: width * scansperchunk * channels * sizeof(half)
+                        // Get the actual max unpacked size from the file
+                        uint64_t maxUnpackedSize = 0;
+                        exr_get_chunk_unpacked_size(*_ctxt, partNumber, &maxUnpackedSize);
+                        
+                        // Estimate max data for range calculation
                         int width = dw.max.x - dw.min.x + 1;
-                        size_t maxPackedSizeEstimate = width * scansperchunk * 3 * 2;
+                        size_t maxPackedSizeEstimate = (size_t)maxUnpackedSize; // Conservative
                         
                         // Calculate total range to read
                         size_t totalRangeSize = (maxLeaderOffset - minLeaderOffset) + leaderSize + maxPackedSizeEstimate;
@@ -792,8 +819,16 @@ void ScanLineInputFile::Data::readPixels (
                                 ci.level_x = 0;
                                 ci.level_y = 0;
                                 ci.packed_size = packed_size;
-                                // Conservative: keep part-level max if available, but at least bound by chunkH
-                                ci.unpacked_size = (uint64_t)width * (uint64_t)std::max<int32_t>(chunkH, 0) * 6;
+                                // Compute unpacked_size based on actual chunk height
+                                // maxUnpackedSize is for a full chunk (scansperchunk lines)
+                                // Scale proportionally for partial chunks (edge case)
+                                if (chunkH == scansperchunk) {
+                                    ci.unpacked_size = maxUnpackedSize;
+                                } else if (scansperchunk > 0 && chunkH > 0) {
+                                    ci.unpacked_size = (maxUnpackedSize * (uint64_t)chunkH) / (uint64_t)scansperchunk;
+                                } else {
+                                    ci.unpacked_size = 0;
+                                }
                                 ci.data_offset = sci.leaderOffset + leaderSize;
                                 ci.sample_count_data_offset = 0;
                                 ci.sample_count_table_size = 0;
@@ -838,38 +873,29 @@ void ScanLineInputFile::Data::readPixels (
         usePrefetch = false;
     }
     // ==================== END I/O MERGING ====================
+    
+    // When IOMerge is active, we must use single-threaded processing because
+    // g_scanlinePrefetchBuffer is thread_local and won't be visible to worker threads.
+    // The I/O merging benefit (fewer pread calls) is still retained.
+    bool useMultiThreading = (nchunks > 1 && numThreads > 1 && !usePrefetch);
 
 #if ILMTHREAD_THREADING_ENABLED
-    if (nchunks > 1 && numThreads > 1)
+    if (useMultiThreading)
     {
         ScanLineProcessGroup sg (numThreads);
 
         {
             ILMTHREAD_NAMESPACE::TaskGroup tg;
 
-            if (usePrefetch && !allChunks.empty())
+            for (int y = scanLine1; y <= scanLine2; )
             {
-                // Reuse collected chunk info
-                int y = scanLine1;
-                for (const auto& chunk : allChunks)
-                {
-                    ILMTHREAD_NAMESPACE::ThreadPool::addGlobalTask (
-                        new LineBufferTask (&tg, this, &sg, &fb, chunk, y, scanLine2) );
-                    y += scansperchunk - (y - chunk.start_y);
-                }
-            }
-            else
-            {
-                for (int y = scanLine1; y <= scanLine2; )
-                {
-                    if (EXR_ERR_SUCCESS != exr_read_scanline_chunk_info (*_ctxt, partNumber, y, &cinfo))
-                        throw IEX_NAMESPACE::InputExc ("Unable to query scanline information");
+                if (EXR_ERR_SUCCESS != exr_read_scanline_chunk_info (*_ctxt, partNumber, y, &cinfo))
+                    throw IEX_NAMESPACE::InputExc ("Unable to query scanline information");
 
-                    ILMTHREAD_NAMESPACE::ThreadPool::addGlobalTask (
-                        new LineBufferTask (&tg, this, &sg, &fb, cinfo, y, scanLine2) );
+                ILMTHREAD_NAMESPACE::ThreadPool::addGlobalTask (
+                    new LineBufferTask (&tg, this, &sg, &fb, cinfo, y, scanLine2) );
 
-                    y += scansperchunk - (y - cinfo.start_y);
-                }
+                y += scansperchunk - (y - cinfo.start_y);
             }
         }
 
@@ -886,11 +912,20 @@ void ScanLineInputFile::Data::readPixels (
             for (const auto& chunk : allChunks)
             {
                 sp->cinfo = chunk;
+                // IMPORTANT: Use max(chunk.start_y, scanLine1) as fbY to match
+                // non-IOMerge behavior. This ensures decode_to_ptr calculation
+                // in update_pointers() produces correct pointer:
+                //   ptr = fbslice->base + fbY * yStride
+                //       = (basePtr - origin.y * yStride) + fbY * yStride
+                //       = basePtr + (fbY - origin.y) * yStride
+                // If origin.y = scanLine1 (from Slice::Make), we need fbY >= scanLine1
+                // to avoid writing before the allocated buffer.
+                int fbY = std::max(chunk.start_y, scanLine1);
                 sp->run_decode (
                     *_ctxt,
                     partNumber,
                     &fb,
-                    chunk.start_y,
+                    fbY,
                     scanLine2,
                     fill_list);
             }
@@ -982,10 +1017,11 @@ void ScanLineProcess::run_decode (
     // stash the flag off to make sure to clean up in the event
     // of an exception by changing the flag after init...
     bool isfirst = first;
+    
     if (first)
     {
-        if (EXR_ERR_SUCCESS !=
-            exr_decoding_initialize (ctxt, pn, &cinfo, &decoder))
+        exr_result_t rv = exr_decoding_initialize (ctxt, pn, &cinfo, &decoder);
+        if (EXR_ERR_SUCCESS != rv)
         {
             throw IEX_NAMESPACE::IoExc ("Unable to initialize decode pipeline");
         }
@@ -994,8 +1030,8 @@ void ScanLineProcess::run_decode (
     }
     else
     {
-        if (EXR_ERR_SUCCESS !=
-            exr_decoding_update (ctxt, pn, &cinfo, &decoder))
+        exr_result_t rv = exr_decoding_update (ctxt, pn, &cinfo, &decoder);
+        if (EXR_ERR_SUCCESS != rv)
         {
             throw IEX_NAMESPACE::IoExc ("Unable to update decode pipeline");
         }
