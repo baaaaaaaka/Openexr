@@ -128,6 +128,7 @@ struct PrefetchBuffer {
 static thread_local PrefetchBuffer g_prefetchBuffer;
 
 // Custom read function that uses prefetched data - zero-copy version
+// For COMPRESSED data: sets packed_buffer pointer to prefetch buffer
 static exr_result_t
 prefetched_read_chunk(exr_decode_pipeline_t* decode)
 {
@@ -142,7 +143,6 @@ prefetched_read_chunk(exr_decode_pipeline_t* decode)
     }
     
     size_t bufferPos = it->second.first;
-    size_t expectedSize = it->second.second;
     
     // Verify buffer position is valid
     size_t packedSize = decode->chunk.packed_size;
@@ -152,13 +152,151 @@ prefetched_read_chunk(exr_decode_pipeline_t* decode)
     
     // ZERO-COPY approach: Point packed_buffer directly to prefetch buffer
     // Set packed_alloc_size = 0 to prevent OpenEXR from freeing it
-    // This is safe because:
-    // 1. g_prefetchBuffer.data is valid for the entire readTiles call
-    // 2. TileProcess is destroyed BEFORE we clear g_prefetchBuffer.data
-    // 3. packed_alloc_size = 0 tells OpenEXR "don't free this buffer"
-    
     decode->packed_buffer = g_prefetchBuffer.data.data() + bufferPos;
     decode->packed_alloc_size = 0;  // CRITICAL: Prevents exr_decoding_destroy from freeing
+    
+    return EXR_ERR_SUCCESS;
+}
+
+// Helper function to swap bytes to native endian (little-endian on x86)
+static inline void swap_to_native16(uint8_t* ptr, size_t count)
+{
+#if defined(__BIG_ENDIAN__) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+    uint16_t* p = reinterpret_cast<uint16_t*>(ptr);
+    for (size_t i = 0; i < count; ++i) {
+        p[i] = ((p[i] & 0xFF) << 8) | ((p[i] >> 8) & 0xFF);
+    }
+#else
+    (void)ptr; (void)count; // No-op on little-endian
+#endif
+}
+
+static inline void swap_to_native32(uint8_t* ptr, size_t count)
+{
+#if defined(__BIG_ENDIAN__) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+    uint32_t* p = reinterpret_cast<uint32_t*>(ptr);
+    for (size_t i = 0; i < count; ++i) {
+        p[i] = ((p[i] & 0xFF) << 24) | ((p[i] & 0xFF00) << 8) |
+               ((p[i] >> 8) & 0xFF00) | ((p[i] >> 24) & 0xFF);
+    }
+#else
+    (void)ptr; (void)count; // No-op on little-endian
+#endif
+}
+
+// Custom read function for UNCOMPRESSED data from prefetch buffer
+// This mimics read_uncompressed_direct but reads from prefetch buffer instead of file
+// Also handles Y-crop (user_line_begin_skip, user_line_end_ignore) and 
+// X-crop (user_pixel_begin_skip, user_pixel_end_ignore)
+//
+// Memory copy analysis:
+// - For uncompressed data, this function necessarily copies from prefetch buffer to output.
+// - This is ONE memcpy per scanline, trading I/O calls for memory bandwidth.
+// - On high-latency filesystems (Lustre/GPFS), this tradeoff is beneficial:
+//   * Without IOMerge: N tiles × 1 pread each = N I/O round trips
+//   * With IOMerge: 1 merged pread + N memcpy = 1 I/O round trip + fast memory ops
+// - The memcpy overhead is typically <1% of I/O latency on network filesystems.
+static exr_result_t
+prefetched_read_uncompressed_direct(exr_decode_pipeline_t* decode)
+{
+    if (!g_prefetchBuffer.active) {
+        return EXR_ERR_INVALID_ARGUMENT;
+    }
+    
+    uint64_t dataOffset = decode->chunk.data_offset;
+    auto it = g_prefetchBuffer.offsetMap.find(dataOffset);
+    if (it == g_prefetchBuffer.offsetMap.end()) {
+        return EXR_ERR_INVALID_ARGUMENT;
+    }
+    
+    size_t bufferPos = it->second.first;
+    size_t bufferSize = it->second.second;
+    
+    // Pointer to the start of chunk data in prefetch buffer
+    const uint8_t* srcData = g_prefetchBuffer.data.data() + bufferPos;
+    size_t srcOffset = 0;
+    
+    int height = decode->chunk.height;
+    int start_y = decode->chunk.start_y;
+    
+    // Y-crop parameters
+    int line_begin_skip = decode->user_line_begin_skip;
+    int line_end_ignore = decode->user_line_end_ignore;
+    
+    // X-crop parameters  
+    int pixel_begin_skip = decode->user_pixel_begin_skip;
+    int pixel_end_ignore = decode->user_pixel_end_ignore;
+    
+    for (int y = 0; y < height; ++y)
+    {
+        // Check if this line should be skipped (Y-crop)
+        bool skipLine = (y < line_begin_skip) || (y >= height - line_end_ignore);
+        
+        for (int c = 0; c < decode->channel_count; ++c)
+        {
+            exr_coding_channel_info_t* decc = &decode->channels[c];
+            
+            if (decc->height == 0) continue;
+            
+            // Full scanline width in bytes (for source data)
+            size_t fullLineBytes = (size_t)decc->width * (size_t)decc->bytes_per_element;
+            
+            if (decc->y_samples > 1)
+            {
+                if (((start_y + y) % decc->y_samples) != 0) continue;
+            }
+            
+            // Verify we have enough data in prefetch buffer
+            if (srcOffset + fullLineBytes > bufferSize) {
+                return EXR_ERR_OUT_OF_MEMORY;
+            }
+            
+            if (skipLine || !decc->decode_to_ptr)
+            {
+                // Skip this line's data
+                srcOffset += fullLineBytes;
+                continue;
+            }
+            
+            // Calculate output pointer
+            uint8_t* cdata = decc->decode_to_ptr;
+            
+            int output_y = y - line_begin_skip;
+            if (decc->y_samples > 1)
+            {
+                cdata += ((size_t)(output_y / decc->y_samples) * (size_t)decc->user_line_stride);
+            }
+            else
+            {
+                cdata += (size_t)output_y * (size_t)decc->user_line_stride;
+            }
+            
+            // Apply X-crop
+            int out_width = decc->width - pixel_begin_skip - pixel_end_ignore;
+            if (out_width <= 0)
+            {
+                srcOffset += fullLineBytes;
+                continue;
+            }
+            
+            size_t skipBytes = (size_t)pixel_begin_skip * (size_t)decc->bytes_per_element;
+            size_t copyBytes = (size_t)out_width * (size_t)decc->bytes_per_element;
+            
+            // Copy cropped portion from prefetch buffer to output
+            // This memcpy is necessary because:
+            // 1. Output may have different stride than source
+            // 2. X-crop requires reading from middle of source line
+            // 3. Prefetch buffer is temporary and will be cleared after readTiles()
+            memcpy(cdata, srcData + srcOffset + skipBytes, copyBytes);
+            srcOffset += fullLineBytes;
+            
+            // Byte swap to native endian if needed (no-op on little-endian x86)
+            if (decc->bytes_per_element == 2)
+                swap_to_native16(cdata, out_width);
+            else if (decc->bytes_per_element == 4)
+                swap_to_native32(cdata, out_width);
+        }
+    }
     
     return EXR_ERR_SUCCESS;
 }
@@ -1357,44 +1495,39 @@ void TiledInputFile::Data::readTiles (int dx1, int dx2, int dy1, int dy2, int lx
     }
     // ==================== END I/O MERGING ====================
 
+    // When IOMerge prefetch is active, we MUST use single-threaded processing
+    // because g_prefetchBuffer is thread_local and worker threads won't see it.
+    // The I/O merging benefit (fewer pread calls) is still achieved; we just
+    // decode tiles sequentially after the merged read.
+    bool useMultiThreading = (nTiles > 1 && numThreads > 1 && !usePrefetch);
+    
 #if ILMTHREAD_THREADING_ENABLED
-    if (nTiles > 1 && numThreads > 1)
+    if (useMultiThreading)
     {
         TileProcessGroup tpg (numThreads);
 
         {
             ILMTHREAD_NAMESPACE::TaskGroup tg;
 
-            if (usePrefetch && !allChunks.empty())
+            // Note: usePrefetch is false here due to the condition above
+            for (int ty = dy1; ty <= dy2; ++ty)
             {
-                // Reuse collected chunk info
-                for (const auto& chunk : allChunks)
+                for (int tx = dx1; tx <= dx2; ++tx)
                 {
-                    ILMTHREAD_NAMESPACE::ThreadPool::addGlobalTask (
-                        new TileBufferTask (&tg, this, &tpg, &frameBuffer, chunk) );
-                }
-            }
-            else
-            {
-                for (int ty = dy1; ty <= dy2; ++ty)
-                {
-                    for (int tx = dx1; tx <= dx2; ++tx)
+                    exr_result_t rv = exr_read_tile_chunk_info (
+                        *_ctxt, partNumber, tx, ty, lx, ly, &cinfo);
+                    if (EXR_ERR_INCOMPLETE_CHUNK_TABLE == rv)
                     {
-                        exr_result_t rv = exr_read_tile_chunk_info (
-                            *_ctxt, partNumber, tx, ty, lx, ly, &cinfo);
-                        if (EXR_ERR_INCOMPLETE_CHUNK_TABLE == rv)
-                        {
-                            THROW (
-                                IEX_NAMESPACE::InputExc,
-                                "Tile (" << tx << ", " << ty << ", " << lx << ", " << ly
-                                << ") is missing.");
-                        }
-                        else if (EXR_ERR_SUCCESS != rv)
-                            throw IEX_NAMESPACE::InputExc ("Unable to query tile information");
-
-                        ILMTHREAD_NAMESPACE::ThreadPool::addGlobalTask (
-                            new TileBufferTask (&tg, this, &tpg, &frameBuffer, cinfo) );
+                        THROW (
+                            IEX_NAMESPACE::InputExc,
+                            "Tile (" << tx << ", " << ty << ", " << lx << ", " << ly
+                            << ") is missing.");
                     }
+                    else if (EXR_ERR_SUCCESS != rv)
+                        throw IEX_NAMESPACE::InputExc ("Unable to query tile information");
+
+                    ILMTHREAD_NAMESPACE::ThreadPool::addGlobalTask (
+                        new TileBufferTask (&tg, this, &tpg, &frameBuffer, cinfo) );
                 }
             }
         }
@@ -1548,7 +1681,18 @@ void TileProcess::run_decode (
     // If prefetch buffer is active, use custom read function
     if (g_prefetchBuffer.active)
     {
-        decoder.read_fn = &prefetched_read_chunk;
+        if (decoder.decompress_fn != nullptr)
+        {
+            // Compressed data: use prefetched_read_chunk which sets packed_buffer
+            // The decompress_fn and unpack_and_convert_fn will handle the rest
+            decoder.read_fn = &prefetched_read_chunk;
+        }
+        else
+        {
+            // Uncompressed data: use prefetched_read_uncompressed_direct
+            // which reads directly from prefetch buffer to output channels
+            decoder.read_fn = &prefetched_read_uncompressed_direct;
+        }
     }
 
     if (EXR_ERR_SUCCESS != exr_decoding_run (ctxt, pn, &decoder))

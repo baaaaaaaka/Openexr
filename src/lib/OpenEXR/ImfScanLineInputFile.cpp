@@ -49,6 +49,7 @@ struct ScanLinePrefetchBuffer {
 static thread_local ScanLinePrefetchBuffer g_scanlinePrefetchBuffer;
 
 // Custom read function that uses prefetched scanline data - zero-copy version
+// For COMPRESSED data: sets packed_buffer pointer to prefetch buffer
 static exr_result_t
 scanline_prefetched_read_chunk(exr_decode_pipeline_t* decode)
 {
@@ -71,6 +72,99 @@ scanline_prefetched_read_chunk(exr_decode_pipeline_t* decode)
     
     decode->packed_buffer = g_scanlinePrefetchBuffer.data.data() + bufferPos;
     decode->packed_alloc_size = 0;  // Mark as not owned - prevents free
+    
+    return EXR_ERR_SUCCESS;
+}
+
+// Helper function to swap bytes to native endian
+static inline void scanline_swap_to_native16(uint8_t* ptr, size_t count)
+{
+#if defined(__BIG_ENDIAN__) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+    uint16_t* p = reinterpret_cast<uint16_t*>(ptr);
+    for (size_t i = 0; i < count; ++i) {
+        p[i] = ((p[i] & 0xFF) << 8) | ((p[i] >> 8) & 0xFF);
+    }
+#else
+    (void)ptr; (void)count;
+#endif
+}
+
+static inline void scanline_swap_to_native32(uint8_t* ptr, size_t count)
+{
+#if defined(__BIG_ENDIAN__) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+    uint32_t* p = reinterpret_cast<uint32_t*>(ptr);
+    for (size_t i = 0; i < count; ++i) {
+        p[i] = ((p[i] & 0xFF) << 24) | ((p[i] & 0xFF00) << 8) |
+               ((p[i] >> 8) & 0xFF00) | ((p[i] >> 24) & 0xFF);
+    }
+#else
+    (void)ptr; (void)count;
+#endif
+}
+
+// Custom read function for UNCOMPRESSED scanline data from prefetch buffer
+// Reads directly from prefetch buffer to output channels
+static exr_result_t
+scanline_prefetched_read_uncompressed_direct(exr_decode_pipeline_t* decode)
+{
+    if (!g_scanlinePrefetchBuffer.active) {
+        return EXR_ERR_INVALID_ARGUMENT;
+    }
+    
+    uint64_t dataOffset = decode->chunk.data_offset;
+    auto it = g_scanlinePrefetchBuffer.offsetMap.find(dataOffset);
+    if (it == g_scanlinePrefetchBuffer.offsetMap.end()) {
+        return EXR_ERR_INVALID_ARGUMENT;
+    }
+    
+    size_t bufferPos = it->second.first;
+    size_t bufferSize = it->second.second;
+    
+    const uint8_t* srcData = g_scanlinePrefetchBuffer.data.data() + bufferPos;
+    size_t srcOffset = 0;
+    
+    int height = decode->chunk.height;
+    int start_y = decode->chunk.start_y;
+    
+    for (int y = 0; y < height; ++y)
+    {
+        for (int c = 0; c < decode->channel_count; ++c)
+        {
+            exr_coding_channel_info_t* decc = &decode->channels[c];
+            
+            if (decc->height == 0) continue;
+            
+            size_t toread = (size_t)decc->width * (size_t)decc->bytes_per_element;
+            
+            uint8_t* cdata = decc->decode_to_ptr;
+            if (!cdata) {
+                srcOffset += toread;
+                continue;
+            }
+            
+            if (decc->y_samples > 1)
+            {
+                if (((start_y + y) % decc->y_samples) != 0) continue;
+                cdata += ((size_t)(y / decc->y_samples) * (size_t)decc->user_line_stride);
+            }
+            else
+            {
+                cdata += (size_t)y * (size_t)decc->user_line_stride;
+            }
+            
+            if (srcOffset + toread > bufferSize) {
+                return EXR_ERR_OUT_OF_MEMORY;
+            }
+            
+            memcpy(cdata, srcData + srcOffset, toread);
+            srcOffset += toread;
+            
+            if (decc->bytes_per_element == 2)
+                scanline_swap_to_native16(cdata, decc->width);
+            else if (decc->bytes_per_element == 4)
+                scanline_swap_to_native32(cdata, decc->width);
+        }
+    }
     
     return EXR_ERR_SUCCESS;
 }
@@ -921,7 +1015,16 @@ void ScanLineProcess::run_decode (
     // If prefetch buffer is active, use custom read function
     if (g_scanlinePrefetchBuffer.active)
     {
-        decoder.read_fn = &scanline_prefetched_read_chunk;
+        if (decoder.decompress_fn != nullptr)
+        {
+            // Compressed data: use prefetch read that sets packed_buffer
+            decoder.read_fn = &scanline_prefetched_read_chunk;
+        }
+        else
+        {
+            // Uncompressed data: use direct read from prefetch buffer to output
+            decoder.read_fn = &scanline_prefetched_read_uncompressed_direct;
+        }
     }
 
     last_decode_err = exr_decoding_run (ctxt, pn, &decoder);

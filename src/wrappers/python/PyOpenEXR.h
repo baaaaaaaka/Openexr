@@ -98,6 +98,20 @@ public:
                      int part_index = 0
                  );
     
+    // Read entire image to buffer with single I/O
+    // Reads entire file into memory in one operation, then decodes to user buffer
+    // Optimal for: Lustre/GPFS, reading entire images, maximizing I/O efficiency
+    // Returns actual number of channels written
+    int          readToBuffer(
+                     int out_channels,                        // desired output channels (1-6)
+                     py::object out_tensor,                   // PyTorch tensor or numpy array
+                     int64_t stride_c,                        // channel stride (in float elements)
+                     int64_t stride_y,                        // row stride (in float elements)
+                     int64_t stride_x,                        // pixel stride (in float elements)
+                     bool drop_alpha = false,                 // drop alpha even if present
+                     int part_index = 0
+                 );
+    
     std::string  filename;
     py::list     parts;
 
