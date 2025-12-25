@@ -153,6 +153,20 @@ IMF_EXPORT void setIOMerge (bool enable);
 
 IMF_EXPORT bool isMergeEnabled ();
 
+//-----------------------------------------------------------------------------
+// IOMerge mode control
+//
+// Controls how I/O operations are merged when reading tiled images:
+// - "row" (default): One pread per tile row (good balance of I/O count and bandwidth)
+// - "single": One pread for entire crop region (minimum I/O, may read extra data)
+//
+// Can also be set via OPENEXR_IOMERGE_MODE environment variable.
+//-----------------------------------------------------------------------------
+
+IMF_EXPORT void setIOMergeMode (const char* mode);
+
+IMF_EXPORT const char* getIOMergeMode ();
+
 OPENEXR_IMF_INTERNAL_NAMESPACE_HEADER_EXIT
 
 #endif

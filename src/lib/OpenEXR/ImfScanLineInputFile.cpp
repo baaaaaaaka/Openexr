@@ -37,8 +37,10 @@
 #include <windows.h>
 #endif
 
-// Reference to global I/O merge flag (defined in ImfTiledInputFile.cpp)
+// Reference to global I/O merge flag and mode (defined in ImfTiledInputFile.cpp)
 extern std::atomic<bool> g_enableIOMerge;
+enum class IOMergeMode { ROW, SINGLE };
+extern IOMergeMode g_iomergeMode;
 
 // Thread-local prefetch buffer for scanline I/O merging
 struct ScanLinePrefetchBuffer {

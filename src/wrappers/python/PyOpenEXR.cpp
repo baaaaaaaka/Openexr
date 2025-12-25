@@ -4775,6 +4775,53 @@ Returns:
     bool: True if I/O merging is enabled, False otherwise.
 )doc");
 
+    m.def("setIOMergeMode", &Imf::setIOMergeMode,
+          py::arg("mode"),
+          R"doc(
+Set the I/O merging mode for tiled image reading.
+
+Controls how I/O operations are merged when reading crop regions:
+
+- "row" (default): One pread per tile row
+  - Good balance of I/O count and bandwidth
+  - For a 10x10 tile crop: 10 pread calls
+  - Reads only needed tile data per row
+
+- "single": One pread for entire crop region  
+  - Minimum I/O count (1 pread)
+  - May read extra data between non-contiguous tiles
+  - Best when tiles are stored contiguously in the file
+
+Can also be set via OPENEXR_IOMERGE_MODE environment variable.
+
+Args:
+    mode: Either "row" or "single"
+
+Example:
+    import OpenEXR
+    
+    # Use single I/O mode for maximum I/O reduction
+    OpenEXR.setIOMergeMode("single")
+    
+    # Read crop (only 1 pread call)
+    f = OpenEXR.File("image.exr", header_only=True)
+    f.readRegionToBuffer(100, 100, 676, 676, 3, out, ...)
+    
+    # Check current mode
+    print(OpenEXR.getIOMergeMode())  # "single"
+    
+    # Reset to default
+    OpenEXR.setIOMergeMode("row")
+)doc");
+
+    m.def("getIOMergeMode", &Imf::getIOMergeMode,
+          R"doc(
+Get the current I/O merging mode.
+
+Returns:
+    str: Either "row" or "single"
+)doc");
+
     m.def("setTileXCrop", &Imf::setTileXCrop,
           py::arg("cropXMin"),
           py::arg("cropXMax"),

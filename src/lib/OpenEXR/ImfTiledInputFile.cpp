@@ -29,6 +29,8 @@
 #include "openexr_decode.h"
 #include "openexr_part.h"
 
+#include <cstdlib>  // for std::getenv
+
 // Global flag to enable non-temporal writes for tile decoding.
 // This is useful for ML data loaders where decoded data is immediately
 // transferred to GPU memory and won't be read again soon.
@@ -117,6 +119,20 @@ IMF_EXPORT void clearTileYCrop()
 // When enabled, multiple tile reads are merged into fewer large I/O operations
 // This variable is also referenced by ImfScanLineInputFile.cpp
 std::atomic<bool> g_enableIOMerge{true};
+
+// IOMerge mode: controls how I/O operations are merged
+// - ROW: One pread per tile row (default, good balance of I/O count and bandwidth)
+// - SINGLE: One pread for entire crop region (minimum I/O, may read extra data)
+// Controlled by OPENEXR_IOMERGE_MODE environment variable
+enum class IOMergeMode { ROW, SINGLE };
+static IOMergeMode g_iomergeMode = []() {
+    const char* env = std::getenv("OPENEXR_IOMERGE_MODE");
+    if (env) {
+        std::string mode(env);
+        if (mode == "single" || mode == "SINGLE") return IOMergeMode::SINGLE;
+    }
+    return IOMergeMode::ROW;  // Default
+}();
 
 // Thread-local prefetch buffer and mapping for merged I/O
 struct PrefetchBuffer {
@@ -359,6 +375,25 @@ IMF_EXPORT void setIOMerge(bool enable)
 IMF_EXPORT bool isMergeEnabled()
 {
     return g_enableIOMerge.load(std::memory_order_relaxed);
+}
+
+// Set IOMerge mode: "row" or "single"
+IMF_EXPORT void setIOMergeMode(const char* mode)
+{
+    if (mode) {
+        std::string modeStr(mode);
+        if (modeStr == "single" || modeStr == "SINGLE") {
+            g_iomergeMode = IOMergeMode::SINGLE;
+        } else {
+            g_iomergeMode = IOMergeMode::ROW;  // Default to ROW for any other value
+        }
+    }
+}
+
+// Get current IOMerge mode
+IMF_EXPORT const char* getIOMergeMode()
+{
+    return (g_iomergeMode == IOMergeMode::SINGLE) ? "single" : "row";
 }
 
 namespace {
@@ -1330,12 +1365,12 @@ void TiledInputFile::Data::readTiles (int dx1, int dx2, int dy1, int dy2, int lx
                         
                         size_t maxPackedSizeEstimate = (size_t)maxUnpackedSize;
                         
-                        // ========== ROW-BASED I/O MERGING ==========
-                        // Each row's tiles are contiguous in the file (row-major order).
-                        // Read per-row ranges to minimize bandwidth while reducing I/O count.
-                        // For 10x10 crop: 10 pread calls instead of 207.
+                        // ========== I/O MERGING ==========
+                        // Mode controlled by OPENEXR_IOMERGE_MODE environment variable:
+                        // - ROW (default): One pread per tile row (good balance)
+                        // - SINGLE: One pread for entire crop region (minimum I/O)
                         
-                        // Build per-row ranges
+                        // Build per-row ranges (used by both modes for offset calculation)
                         struct RowRange {
                             int ty;
                             uint64_t startOffset;
@@ -1345,8 +1380,14 @@ void TiledInputFile::Data::readTiles (int dx1, int dx2, int dy1, int dy2, int lx
                         std::vector<RowRange> rowRanges;
                         
                         int currentRow = -1;
+                        uint64_t globalMinOffset = UINT64_MAX;
+                        uint64_t globalMaxOffset = 0;
+                        
                         for (const auto& ti : tileInfos) {
                             uint64_t tileEnd = ti.leaderOffset + leaderSize + maxPackedSizeEstimate;
+                            globalMinOffset = std::min(globalMinOffset, ti.leaderOffset);
+                            globalMaxOffset = std::max(globalMaxOffset, tileEnd);
+                            
                             if (ti.ty != currentRow) {
                                 // Start new row
                                 RowRange rr;
@@ -1362,38 +1403,68 @@ void TiledInputFile::Data::readTiles (int dx1, int dx2, int dy1, int dy2, int lx
                             }
                         }
                         
-                        // Calculate buffer offsets and total size
-                        size_t totalBufferSize = 0;
-                        for (auto& rr : rowRanges) {
-                            rr.bufferOffset = totalBufferSize;
-                            totalBufferSize += (rr.endOffset - rr.startOffset);
-                        }
-                        
-                        // Allocate buffer
-                        g_prefetchBuffer.data.resize(totalBufferSize);
-                        
-                        // Read each row range with one pread per row
                         bool readSuccess = true;
-                        int fd = ::open(filename, O_RDONLY);
-                        if (fd < 0) {
-                            readSuccess = false;
-                        } else {
-                            for (size_t ri = 0; ri < rowRanges.size(); ri++) {
-                                const auto& rr = rowRanges[ri];
-                                size_t size = rr.endOffset - rr.startOffset;
-                                if(rr.bufferOffset + size > g_prefetchBuffer.data.size()) {
-                                    readSuccess = false;
-                                    break;
-                                }
-                                ssize_t bytesRead = ::pread64(fd, 
-                                    g_prefetchBuffer.data.data() + rr.bufferOffset, 
-                                    size, rr.startOffset);
-                                if (bytesRead != (ssize_t)size) {
-                                    readSuccess = false;
-                                    break;
-                                }
+                        size_t totalBufferSize = 0;
+                        
+                        if (g_iomergeMode == IOMergeMode::SINGLE)
+                        {
+                            // SINGLE mode: One pread for entire crop region
+                            // Pros: Minimum I/O count (1 pread)
+                            // Cons: May read extra data between non-contiguous rows
+                            totalBufferSize = globalMaxOffset - globalMinOffset;
+                            g_prefetchBuffer.data.resize(totalBufferSize);
+                            
+                            // Recalculate row buffer offsets relative to global min
+                            for (auto& rr : rowRanges) {
+                                rr.bufferOffset = rr.startOffset - globalMinOffset;
                             }
-                            ::close(fd);
+                            
+                            int fd = ::open(filename, O_RDONLY);
+                            if (fd < 0) {
+                                readSuccess = false;
+                            } else {
+                                ssize_t bytesRead = ::pread64(fd, 
+                                    g_prefetchBuffer.data.data(), 
+                                    totalBufferSize, globalMinOffset);
+                                if (bytesRead != (ssize_t)totalBufferSize) {
+                                    readSuccess = false;
+                                }
+                                ::close(fd);
+                            }
+                        }
+                        else
+                        {
+                            // ROW mode (default): One pread per tile row
+                            // Pros: Good balance of I/O count and bandwidth
+                            // Cons: Multiple pread calls (one per row)
+                            for (auto& rr : rowRanges) {
+                                rr.bufferOffset = totalBufferSize;
+                                totalBufferSize += (rr.endOffset - rr.startOffset);
+                            }
+                            
+                            g_prefetchBuffer.data.resize(totalBufferSize);
+                            
+                            int fd = ::open(filename, O_RDONLY);
+                            if (fd < 0) {
+                                readSuccess = false;
+                            } else {
+                                for (size_t ri = 0; ri < rowRanges.size(); ri++) {
+                                    const auto& rr = rowRanges[ri];
+                                    size_t size = rr.endOffset - rr.startOffset;
+                                    if(rr.bufferOffset + size > g_prefetchBuffer.data.size()) {
+                                        readSuccess = false;
+                                        break;
+                                    }
+                                    ssize_t bytesRead = ::pread64(fd, 
+                                        g_prefetchBuffer.data.data() + rr.bufferOffset, 
+                                        size, rr.startOffset);
+                                    if (bytesRead != (ssize_t)size) {
+                                        readSuccess = false;
+                                        break;
+                                    }
+                                }
+                                ::close(fd);
+                            }
                         }
                         
                         if (!readSuccess) {
