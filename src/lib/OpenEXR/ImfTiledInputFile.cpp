@@ -111,6 +111,10 @@ IMF_EXPORT void clearTileYCrop()
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+// pread64 is Linux-specific; macOS uses pread which already supports 64-bit offsets
+#ifdef __APPLE__
+#define pread64 pread
+#endif
 #else
 #include <windows.h>
 #endif
@@ -118,7 +122,12 @@ IMF_EXPORT void clearTileYCrop()
 // I/O Merging support for Lustre/GPFS optimization
 // When enabled, multiple tile reads are merged into fewer large I/O operations
 // This variable is also referenced by ImfScanLineInputFile.cpp
+// Note: I/O merging is disabled on Windows because it uses POSIX-specific APIs
+#ifdef _WIN32
+std::atomic<bool> g_enableIOMerge{false};
+#else
 std::atomic<bool> g_enableIOMerge{true};
+#endif
 
 // IOMerge mode: controls how I/O operations are merged
 // - ROW: One pread per tile row (default, good balance of I/O count and bandwidth)
@@ -1406,6 +1415,7 @@ void TiledInputFile::Data::readTiles (int dx1, int dx2, int dy1, int dy2, int lx
                         bool readSuccess = true;
                         size_t totalBufferSize = 0;
                         
+#ifndef _WIN32
                         if (g_iomergeMode == IOMergeMode::SINGLE)
                         {
                             // SINGLE mode: One pread for entire crop region
@@ -1466,6 +1476,10 @@ void TiledInputFile::Data::readTiles (int dx1, int dx2, int dy1, int dy2, int lx
                                 ::close(fd);
                             }
                         }
+#else
+                        // I/O merging not supported on Windows - disable prefetch
+                        readSuccess = false;
+#endif
                         
                         if (!readSuccess) {
                             usePrefetch = false;

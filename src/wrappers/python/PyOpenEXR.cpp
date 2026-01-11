@@ -60,10 +60,17 @@
 #include <ImfVecAttribute.h>
 
 #include <typeinfo>
+#ifndef _WIN32
 #include <sys/types.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+// pread64 is Linux-specific; macOS uses pread which already supports 64-bit offsets
+#ifdef __APPLE__
+#define pread64 pread
+#endif
+#endif
+// Note: We don't need windows.h here anymore since I/O merging is disabled on Windows
 
 // OpenEXR C Core for chunk info
 #include <openexr.h>
@@ -2654,6 +2661,7 @@ PyFile::readRegionToBufferLustre(int xMin, int yMin, int xMax, int yMax,
     const auto type = h.type();
     const Box2i& dw = h.dataWindow();
     
+#ifndef _WIN32
     // Get file size
     struct stat st;
     if (::stat(filename.c_str(), &st) < 0) {
@@ -2733,8 +2741,9 @@ PyFile::readRegionToBufferLustre(int xMin, int yMin, int xMax, int yMax,
                                   out_tensor, stride_c, stride_y, stride_x,
                                   drop_alpha, part_index);
     }
+#endif  // !_WIN32
     
-    // Otherwise, use standard method (multiple I/O calls)
+    // On Windows or when merged I/O is not beneficial, use standard method
     return readRegionToBuffer(xMin, yMin, xMax, yMax, out_channels,
                               out_tensor, stride_c, stride_y, stride_x,
                               drop_alpha, part_index);
@@ -2790,6 +2799,7 @@ PyFile::readToBuffer(int out_channels,
                                   drop_alpha, part_index);
     }
     
+#ifndef _WIN32
     // For file-based access, read entire file into memory first
     if (filename.empty() || filename == "(memory)") {
         // Already in memory or no filename
@@ -2834,6 +2844,12 @@ PyFile::readToBuffer(int out_channels,
     return readRegionToBuffer(xMin, yMin, xMax, yMax, out_channels,
                               out_tensor, stride_c, stride_y, stride_x,
                               drop_alpha, part_index);
+#else
+    // On Windows, just use standard readRegionToBuffer
+    return readRegionToBuffer(xMin, yMin, xMax, yMax, out_channels,
+                              out_tensor, stride_c, stride_y, stride_x,
+                              drop_alpha, part_index);
+#endif
 }
 
 //
