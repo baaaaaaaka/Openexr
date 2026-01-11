@@ -40,6 +40,7 @@ jobs:
     name: Python Wheels - ${{ matrix.os }}-${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -71,7 +72,9 @@ jobs:
       - name: Build wheel
         uses: pypa/cibuildwheel@v3.3
         env:
-          CIBW_ARCHS_MACOS: x86_64 arm64 universal2
+          # Avoid cross-arch builds on macOS runners: build x86_64 wheels on
+          # intel runners and arm64 wheels on arm runners.
+          CIBW_ARCHS_MACOS: ${{ matrix.arch == 'x64' && 'x86_64' || 'arm64' }}
           # Build Python 3.8 through 3.13
           # Skip 32-bit wheels builds on Windows
           # Also skip the PyPy builds, since they fail the unit tests

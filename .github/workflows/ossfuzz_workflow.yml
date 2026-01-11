@@ -47,8 +47,26 @@ jobs:
         oss-fuzz-project-name: 'openexr'
         dry-run: false
         language: c++
-        # Point the action at the checked out repo so it can detect the SHA.
+        # Note: this action uses OSS-Fuzz "internal" mode by default and tries to
+        # detect/checkout the main repo from the project Dockerfile. That breaks
+        # for fork-only commits because the project Dockerfile clones upstream.
+        #
+        # We therefore provide a local checkout and force CIFuzz to use the
+        # generic CI platform config so it will build using this workspace copy.
+        # This must be a host path (used for docker volume mounting).
         project-src-path: ${{ github.workspace }}
+      env:
+        # Force CIFuzz to use BasePlatformConfig (internal generic CI) so it
+        # uses PROJECT_SRC_PATH (our checkout) rather than trying to infer the
+        # repo name from GITHUB_REPOSITORY and copying from the image.
+        CFL_PLATFORM: generic
+        WORKSPACE: ${{ github.workspace }}
+        # The OSS-Fuzz Dockerfile clones "openexr" (lowercase); ensure repo
+        # detection uses the same name.
+        REPOSITORY: openexr
+        # Provide a base commit for diffing (push events); if empty, CIFuzz will
+        # keep all fuzz targets.
+        GIT_BASE_COMMIT: ${{ github.event.before }}
     - name: Run Fuzzers
       uses: google/oss-fuzz/infra/cifuzz/actions/run_fuzzers@32f1d4deadc82279ec9001a837f2424e185c69a2 # master
       with:
