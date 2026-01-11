@@ -40,9 +40,12 @@ jobs:
         repository: baaaaaaaka/Openexr
         ref: ${{ github.sha }}
         fetch-depth: 0
+        # CIFuzz copies the repo into /src/<basename>. OSS-Fuzz project's Dockerfile
+        # expects it at /src/openexr, so ensure the checkout directory name matches.
+        path: openexr
     - name: Build Fuzzers
       id: build
-      uses: google/oss-fuzz/infra/cifuzz/actions/build_fuzzers@32f1d4deadc82279ec9001a837f2424e185c69a2 # master
+      uses: google/oss-fuzz/infra/cifuzz/actions/build_fuzzers@aaf9682d5a174a4902d62bcec86a783f605af958 # master
       with:
         oss-fuzz-project-name: 'openexr'
         dry-run: false
@@ -54,7 +57,7 @@ jobs:
         # We therefore provide a local checkout and force CIFuzz to use the
         # generic CI platform config so it will build using this workspace copy.
         # This must be a host path (used for docker volume mounting).
-        project-src-path: ${{ github.workspace }}
+        project-src-path: ${{ github.workspace }}/openexr
       env:
         # Force CIFuzz to use BasePlatformConfig (internal generic CI) so it
         # uses PROJECT_SRC_PATH (our checkout) rather than trying to infer the
@@ -68,12 +71,18 @@ jobs:
         # keep all fuzz targets.
         GIT_BASE_COMMIT: ${{ github.event.before }}
     - name: Run Fuzzers
-      uses: google/oss-fuzz/infra/cifuzz/actions/run_fuzzers@32f1d4deadc82279ec9001a837f2424e185c69a2 # master
+      uses: google/oss-fuzz/infra/cifuzz/actions/run_fuzzers@aaf9682d5a174a4902d62bcec86a783f605af958 # master
       with:
         oss-fuzz-project-name: 'openexr'
         fuzz-seconds: 300
         dry-run: false
         language: c++
+      env:
+        # Keep CIFuzz platform config consistent with the build step.
+        CFL_PLATFORM: generic
+        WORKSPACE: ${{ github.workspace }}
+        REPOSITORY: openexr
+        GIT_BASE_COMMIT: ${{ github.event.before }}
     - name: Upload Crash
       uses: actions/upload-artifact@v5
       if: failure() && steps.build.outcome == 'success'
