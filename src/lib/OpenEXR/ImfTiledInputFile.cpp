@@ -122,7 +122,9 @@ IMF_EXPORT void clearTileYCrop()
 // I/O Merging support for Lustre/GPFS optimization
 // When enabled, multiple tile reads are merged into fewer large I/O operations
 // This variable is also referenced by ImfScanLineInputFile.cpp
-// Note: I/O merging is disabled on Windows because it uses POSIX-specific APIs
+// I/O merging support for Lustre/GPFS optimization.
+// This is a core performance feature intended to reduce I/O calls for
+// partial-read workloads. It is enabled by default on non-Windows platforms.
 #ifdef _WIN32
 std::atomic<bool> g_enableIOMerge{false};
 #else
@@ -176,7 +178,12 @@ prefetched_read_chunk(exr_decode_pipeline_t* decode)
     }
     
     // ZERO-COPY approach: Point packed_buffer directly to prefetch buffer
-    // Set packed_alloc_size = 0 to prevent OpenEXR from freeing it
+    // Free any previously allocated buffer and mark as not owned.
+    if (decode->packed_buffer && decode->packed_alloc_size > 0)
+    {
+        if (decode->free_fn)
+            decode->free_fn(EXR_TRANSCODE_BUFFER_PACKED, decode->packed_buffer);
+    }
     decode->packed_buffer = g_prefetchBuffer.data.data() + bufferPos;
     decode->packed_alloc_size = 0;  // CRITICAL: Prevents exr_decoding_destroy from freeing
     
@@ -1189,6 +1196,11 @@ void TiledInputFile::Data::readTiles (int dx1, int dx2, int dy1, int dy2, int lx
     
     bool usePrefetch = g_enableIOMerge.load(std::memory_order_relaxed) && nTiles > 1;
     std::vector<exr_chunk_info_t> allChunks;
+    // Track missing tiles (chunk table entry == 0) so we can report InputExc
+    // even when we successfully prefetch/decode the tiles that do exist.
+    bool sawMissingTile = false;
+    int  missingTileX   = -1;
+    int  missingTileY   = -1;
     
     if (usePrefetch)
     {
@@ -1349,6 +1361,19 @@ void TiledInputFile::Data::readTiles (int dx1, int dx2, int dy1, int dy2, int lx
                                 maxLeaderOffset = std::max(maxLeaderOffset, ti.leaderOffset);
                                 tileInfos.push_back(ti);
                             }
+                            else
+                            {
+                                // Missing tile entry in chunk table (partial / incomplete file).
+                                // We can't prefetch missing tiles; decode any present ones, but
+                                // ultimately we must report missing tiles to match the
+                                // exr_read_tile_chunk_info() behavior.
+                                sawMissingTile = true;
+                                if (missingTileX < 0)
+                                {
+                                    missingTileX = tx;
+                                    missingTileY = ty;
+                                }
+                            }
                         }
                     }
                 }
@@ -1358,8 +1383,46 @@ void TiledInputFile::Data::readTiles (int dx1, int dx2, int dy1, int dy2, int lx
                 }
                 else
                 {
-                    // Leader size: 20 bytes (5 int32) for single-part
-                    size_t leaderSize = 20;  // tx, ty, lx, ly, packed_size
+                    // Determine multipart-ness and storage mode to parse leaders correctly.
+                    int partCount = 0;
+                    bool isMultipart = false;
+                    exr_storage_t storageMode = EXR_STORAGE_LAST_TYPE;
+                    if (EXR_ERR_SUCCESS != exr_get_count(*_ctxt, &partCount) || partCount <= 0)
+                        usePrefetch = false;
+                    else
+                        isMultipart = (partCount > 1);
+                    if (usePrefetch && EXR_ERR_SUCCESS != exr_get_storage(*_ctxt, partNumber, &storageMode))
+                        usePrefetch = false;
+                    // Deep tiled leaders include additional fields; prefetch for deep tiled
+                    // is not implemented here (falls back to standard path).
+                    if (usePrefetch && storageMode == EXR_STORAGE_DEEP_TILED)
+                        usePrefetch = false;
+
+                    // Compute bytes-per-pixel exactly as OpenEXRCore does when it
+                    // fills exr_chunk_info_t (see exr_read_tile_chunk_info).
+                    // Note: This intentionally ignores x/y sampling, matching the
+                    // OpenEXRCore chunk.c calculation for unpacked_size.
+                    const exr_attr_chlist_t* chlist = nullptr;
+                    uint64_t bytesPerPixel = 0;
+                    if (EXR_ERR_SUCCESS != exr_get_channels(*_ctxt, partNumber, &chlist) ||
+                        !chlist || chlist->num_channels <= 0)
+                    {
+                        usePrefetch = false;
+                    }
+                    else
+                    {
+                        for (int c = 0; c < chlist->num_channels; ++c)
+                        {
+                            const exr_attr_chlist_entry_t* curc = (chlist->entries + c);
+                            bytesPerPixel +=
+                                (uint64_t)((curc->pixel_type == EXR_PIXEL_HALF) ? 2 : 4);
+                        }
+                    }
+
+                    // Leader size for tiled (non-deep):
+                    // - single-part: [tx][ty][lx][ly][packed_size] => 20 bytes
+                    // - multi-part:  [part][tx][ty][lx][ly][packed_size] => 24 bytes
+                    size_t leaderSize = isMultipart ? 24 : 20;
                     
                     // Get compression type for chunk info
                     exr_compression_t compType;
@@ -1387,30 +1450,43 @@ void TiledInputFile::Data::readTiles (int dx1, int dx2, int dy1, int dy2, int lx
                             size_t bufferOffset;
                         };
                         std::vector<RowRange> rowRanges;
-                        
-                        int currentRow = -1;
                         uint64_t globalMinOffset = UINT64_MAX;
                         uint64_t globalMaxOffset = 0;
-                        
-                        for (const auto& ti : tileInfos) {
+
+                        // Group tiles by row (ty) using min/max offsets rather than assuming
+                        // we have every tile for every row. This avoids mis-associating tiles
+                        // to the wrong row range when chunk table entries are missing/zero.
+                        std::unordered_map<int, size_t> rowIndex;
+                        rowIndex.reserve((size_t)std::max(1, dy2 - dy1 + 1));
+
+                        for (const auto& ti : tileInfos)
+                        {
                             uint64_t tileEnd = ti.leaderOffset + leaderSize + maxPackedSizeEstimate;
-                            globalMinOffset = std::min(globalMinOffset, ti.leaderOffset);
-                            globalMaxOffset = std::max(globalMaxOffset, tileEnd);
-                            
-                            if (ti.ty != currentRow) {
-                                // Start new row
+                            globalMinOffset  = std::min(globalMinOffset, ti.leaderOffset);
+                            globalMaxOffset  = std::max(globalMaxOffset, tileEnd);
+
+                            auto it = rowIndex.find(ti.ty);
+                            if (it == rowIndex.end())
+                            {
                                 RowRange rr;
-                                rr.ty = ti.ty;
+                                rr.ty          = ti.ty;
                                 rr.startOffset = ti.leaderOffset;
-                                rr.endOffset = tileEnd;
-                                rr.bufferOffset = 0;  // Will be set later
+                                rr.endOffset   = tileEnd;
+                                rr.bufferOffset = 0; // set later
+                                rowIndex[ti.ty] = rowRanges.size();
                                 rowRanges.push_back(rr);
-                                currentRow = ti.ty;
-                            } else {
-                                // Extend current row
-                                rowRanges.back().endOffset = std::max(rowRanges.back().endOffset, tileEnd);
+                            }
+                            else
+                            {
+                                RowRange& rr = rowRanges[it->second];
+                                rr.startOffset = std::min(rr.startOffset, ti.leaderOffset);
+                                rr.endOffset   = std::max(rr.endOffset, tileEnd);
                             }
                         }
+
+                        std::sort(
+                            rowRanges.begin(), rowRanges.end(),
+                            [](const RowRange& a, const RowRange& b) { return a.ty < b.ty; });
                         
                         bool readSuccess = true;
                         size_t totalBufferSize = 0;
@@ -1490,31 +1566,73 @@ void TiledInputFile::Data::readTiles (int dx1, int dx2, int dy1, int dy2, int lx
                             allChunks.reserve(nTiles);
                             g_prefetchBuffer.offsetMap.clear();
                             g_prefetchBuffer.offsetMap.reserve(nTiles);
-                            
-                            // Map each tile to its row range
-                            size_t rowIdx = 0;
-                            int tilesInRow = 0;
-                            int tilesPerRow = dx2 - dx1 + 1;
-                            
-                            for (const auto& ti : tileInfos) {
-                                // Move to next row if needed
-                                if (tilesInRow >= tilesPerRow && rowIdx + 1 < rowRanges.size()) {
-                                    rowIdx++;
-                                    tilesInRow = 0;
+
+                            // Build a lookup from row ty -> row range (after sorting)
+                            std::unordered_map<int, const RowRange*> rowMap;
+                            rowMap.reserve(rowRanges.size());
+                            for (const auto& rr : rowRanges) rowMap[rr.ty] = &rr;
+
+                            for (const auto& ti : tileInfos)
+                            {
+                                auto rrit = rowMap.find(ti.ty);
+                                if (rrit == rowMap.end())
+                                {
+                                    allChunks.clear();
+                                    usePrefetch = false;
+                                    break;
+                                }
+
+                                const auto& rr = *rrit->second;
+                                if (ti.leaderOffset < rr.startOffset)
+                                {
+                                    allChunks.clear();
+                                    usePrefetch = false;
+                                    break;
+                                }
+
+                                size_t bufferPos =
+                                    rr.bufferOffset + (size_t)(ti.leaderOffset - rr.startOffset);
+
+                                // Parse leader safely (avoid unaligned int32_t access)
+                                if (bufferPos + leaderSize > g_prefetchBuffer.data.size())
+                                {
+                                    allChunks.clear();
+                                    usePrefetch = false;
+                                    break;
+                                }
+
+                                int32_t leaderVals[6] = {0,0,0,0,0,0};
+                                std::memcpy(
+                                    leaderVals,
+                                    g_prefetchBuffer.data.data() + bufferPos,
+                                    leaderSize);
+
+                                int32_t ldr_part = -1;
+                                int32_t ldr_tx = 0, ldr_ty = 0, ldr_lx = 0, ldr_ly = 0, packed_size = 0;
+                                if (isMultipart)
+                                {
+                                    ldr_part   = leaderVals[0];
+                                    ldr_tx     = leaderVals[1];
+                                    ldr_ty     = leaderVals[2];
+                                    ldr_lx     = leaderVals[3];
+                                    ldr_ly     = leaderVals[4];
+                                    packed_size = leaderVals[5];
+                                }
+                                else
+                                {
+                                    ldr_tx     = leaderVals[0];
+                                    ldr_ty     = leaderVals[1];
+                                    ldr_lx     = leaderVals[2];
+                                    ldr_ly     = leaderVals[3];
+                                    packed_size = leaderVals[4];
                                 }
                                 
-                                const auto& rr = rowRanges[rowIdx];
-                                size_t bufferPos = rr.bufferOffset + (ti.leaderOffset - rr.startOffset);
-                                
-                                // Parse leader
-                                int32_t* leader = reinterpret_cast<int32_t*>(
-                                    g_prefetchBuffer.data.data() + bufferPos);
-                                int32_t ldr_tx = leader[0];
-                                int32_t ldr_ty = leader[1];
-                                int32_t ldr_lx = leader[2];
-                                int32_t ldr_ly = leader[3];
-                                int32_t packed_size = leader[4];
-                                
+                                if (isMultipart && ldr_part != partNumber)
+                                {
+                                    allChunks.clear();
+                                    usePrefetch = false;
+                                    break;
+                                }
                                 if (ldr_tx != ti.tx || ldr_ty != ti.ty || 
                                     ldr_lx != lx || ldr_ly != ly || packed_size <= 0) {
                                     allChunks.clear();
@@ -1549,21 +1667,11 @@ void TiledInputFile::Data::readTiles (int dx1, int dx2, int dy1, int dy2, int lx
                                 ci.level_x = (uint8_t)lx;
                                 ci.level_y = (uint8_t)ly;
                                 ci.packed_size = packed_size;
-                                
-                                // Compute unpacked_size based on actual chunk dimensions.
-                                // For edge tiles, this will be smaller than maxUnpackedSize.
-                                // unpacked_size = width * height * bytes_per_pixel * num_channels
-                                // We need to query channel info to get the correct size.
-                                // For now, use the formula: (levelTileW is base, actual is cwidth x cheight)
-                                // Ratio approach: unpacked = maxUnpackedSize * (cwidth*cheight) / (levelTileW*levelTileH)
-                                if (cwidth == levelTileW && cheight == levelTileH) {
-                                    ci.unpacked_size = maxUnpackedSize;
-                                } else {
-                                    // Scale by actual size ratio
-                                    uint64_t fullTilePixels = (uint64_t)levelTileW * (uint64_t)levelTileH;
-                                    uint64_t actualPixels = (uint64_t)cwidth * (uint64_t)cheight;
-                                    ci.unpacked_size = (maxUnpackedSize * actualPixels) / fullTilePixels;
-                                }
+
+                                // Compute unpacked_size using the same logic as OpenEXRCore:
+                                // unpacked_size = width * height * bytesPerPixel
+                                ci.unpacked_size =
+                                    bytesPerPixel * (uint64_t)cwidth * (uint64_t)cheight;
                                 ci.data_offset = ti.leaderOffset + leaderSize;
                                 ci.sample_count_data_offset = 0;
                                 ci.sample_count_table_size = 0;
@@ -1574,8 +1682,6 @@ void TiledInputFile::Data::readTiles (int dx1, int dx2, int dy1, int dy2, int lx
                                 size_t dataBufferPos = bufferPos + leaderSize;
                                 
                                 g_prefetchBuffer.offsetMap[ci.data_offset] = {dataBufferPos, (size_t)packed_size};
-                                
-                                tilesInRow++;
                             }
                             
                             if (usePrefetch && !allChunks.empty()) {
@@ -1652,6 +1758,16 @@ void TiledInputFile::Data::readTiles (int dx1, int dx2, int dy1, int dy2, int lx
                     partNumber,
                     &frameBuffer,
                     fill_list);
+            }
+
+            // If any requested tiles were missing from the chunk table, report it
+            // (after decoding any tiles we could read) to match the expected API behavior.
+            if (sawMissingTile && missingTileX >= 0 && missingTileY >= 0)
+            {
+                THROW (
+                    IEX_NAMESPACE::InputExc,
+                    "Tile (" << missingTileX << ", " << missingTileY << ", " << lx << ", " << ly
+                    << ") is missing.");
             }
         }
         else
@@ -1795,15 +1911,20 @@ void TileProcess::run_decode (
     {
         if (decoder.decompress_fn != nullptr)
         {
-            // Compressed data: use prefetched_read_chunk which sets packed_buffer
-            // The decompress_fn and unpack_and_convert_fn will handle the rest
+            // Compressed: point packed_buffer into prefetch buffer (zero-copy)
             decoder.read_fn = &prefetched_read_chunk;
         }
         else
         {
-            // Uncompressed data: use prefetched_read_uncompressed_direct
-            // which reads directly from prefetch buffer to output channels
-            decoder.read_fn = &prefetched_read_uncompressed_direct;
+            // Uncompressed:
+            // - If core selected the "read_uncompressed_direct" fast path
+            //   (unpack_and_convert_fn == NULL), copy directly into user buffers.
+            // - Otherwise, present the uncompressed bytes via packed_buffer and
+            //   let the normal unpack/convert routines run.
+            if (decoder.unpack_and_convert_fn == nullptr)
+                decoder.read_fn = &prefetched_read_uncompressed_direct;
+            else
+                decoder.read_fn = &prefetched_read_chunk;
         }
     }
 

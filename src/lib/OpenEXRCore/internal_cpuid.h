@@ -44,12 +44,6 @@ check_for_x86_simd (int* f16c, int* avx, int* sse2)
     *f16c = 0;
 #    endif
 
-#elif defined(__AVX__) && defined(__F16C__)
-    // shortcut if everything is turned on / compiled in
-    *f16c = 1;
-    *avx  = 1;
-    *sse2 = 1;
-
 #elif OPENEXR_ENABLE_X86_SIMD_CHECK
 
 #    if defined(_WIN32)

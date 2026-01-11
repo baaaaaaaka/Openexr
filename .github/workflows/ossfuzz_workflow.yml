@@ -33,6 +33,13 @@ jobs:
   Fuzzing:
     runs-on: ubuntu-latest
     steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        # Explicitly use this fork repo so OSS-Fuzz can locate the commit SHA.
+        repository: baaaaaaaka/Openexr
+        ref: ${{ github.sha }}
+        fetch-depth: 0
     - name: Build Fuzzers
       id: build
       uses: google/oss-fuzz/infra/cifuzz/actions/build_fuzzers@32f1d4deadc82279ec9001a837f2424e185c69a2 # master
@@ -40,6 +47,8 @@ jobs:
         oss-fuzz-project-name: 'openexr'
         dry-run: false
         language: c++
+        # Point the action at the checked out repo so it can detect the SHA.
+        project-src-path: ${{ github.workspace }}
     - name: Run Fuzzers
       uses: google/oss-fuzz/infra/cifuzz/actions/run_fuzzers@32f1d4deadc82279ec9001a837f2424e185c69a2 # master
       with:

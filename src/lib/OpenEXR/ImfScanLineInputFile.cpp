@@ -30,6 +30,40 @@
 
 #include "openexr_part.h"
 
+// Match OpenEXRCore's internal sampling math (internal_util.h)
+static inline int openexr_compute_sampled_height (int height, int y_sampling, int start_y)
+{
+    int nlines;
+    if (y_sampling <= 1) return height;
+    if (height == 1)
+        nlines = (start_y % y_sampling) == 0 ? 1 : 0;
+    else
+    {
+        int start, end;
+        start = start_y % y_sampling;
+        if (start != 0)
+            start = start_y + (y_sampling - start);
+        else
+            start = start_y;
+
+        end = start_y + height - 1;
+        end -= (end < 0 ? -end : end) % y_sampling;
+
+        if (start > end)
+            nlines = start == start_y ? 1 : 0;
+        else
+            nlines = (end - start) / y_sampling + 1;
+    }
+    return nlines;
+}
+
+static inline int openexr_compute_sampled_width (int width, int x_sampling, int start_x)
+{
+    (void)start_x; // see OpenEXRCore: scanline x sampling assumes aligned start_x
+    if (x_sampling <= 1) return width;
+    return (width == 1) ? 1 : (width / x_sampling);
+}
+
 #ifndef _WIN32
 #include <fcntl.h>
 #include <unistd.h>
@@ -297,6 +331,9 @@ struct ScanLineProcess
     bool                  first = true;
     exr_chunk_info_t      cinfo;
     exr_decode_pipeline_t decoder;
+    // Cache default read_fn chosen by OpenEXRCore so we can restore it
+    // when IOMerge prefetch is not active (readPixels calls can alternate).
+    exr_result_t (*default_read_fn)(exr_decode_pipeline_t*) = nullptr;
 
     // requirement to use process group
     ScanLineProcess* next;
@@ -749,6 +786,25 @@ void ScanLineInputFile::Data::readPixels (
                 }
                 else
                 {
+                    // Cache channel list; we will compute per-chunk unpacked_size
+                    // matching OpenEXRCore's compute_chunk_unpack_size.
+                    const exr_attr_chlist_t* chlist = nullptr;
+                    bool hasSampling = false;
+                    if (EXR_ERR_SUCCESS != exr_get_channels(*_ctxt, partNumber, &chlist) ||
+                        !chlist || chlist->num_channels <= 0)
+                    {
+                        usePrefetch = false;
+                    }
+                    else
+                    {
+                        for (int c = 0; c < chlist->num_channels; ++c)
+                        {
+                            const exr_attr_chlist_entry_t* curc = (chlist->entries + c);
+                            if (curc->x_sampling > 1 || curc->y_sampling > 1)
+                                hasSampling = true;
+                        }
+                    }
+
                     // Get compression type
                     exr_compression_t compType;
                     if (EXR_ERR_SUCCESS != exr_get_compression(*_ctxt, partNumber, &compType)) {
@@ -756,8 +812,25 @@ void ScanLineInputFile::Data::readPixels (
                     }
                     else
                     {
-                        // Leader size for scanline: 8 bytes (y + packed_size) or 12 for multipart
-                        size_t leaderSize = 8;
+                        // Determine multipart-ness and storage mode to parse leaders correctly.
+                        int partCount = 0;
+                        bool isMultipart = false;
+                        exr_storage_t storageMode = EXR_STORAGE_LAST_TYPE;
+                        if (EXR_ERR_SUCCESS != exr_get_count(*_ctxt, &partCount) || partCount <= 0)
+                            usePrefetch = false;
+                        else
+                            isMultipart = (partCount > 1);
+                        if (usePrefetch && EXR_ERR_SUCCESS != exr_get_storage(*_ctxt, partNumber, &storageMode))
+                            usePrefetch = false;
+
+                        // Leader size for scanline:
+                        // - single-part scanline: [y][packed_size] => 8 bytes
+                        // - multi-part scanline:  [part][y][packed_size] => 12 bytes
+                        // Deep scanline leaders include additional 64-bit values; prefetch for deep
+                        // is not implemented here (falls back to standard path).
+                        size_t leaderSize = isMultipart ? 12 : 8;
+                        if (usePrefetch && storageMode == EXR_STORAGE_DEEP_SCANLINE)
+                            usePrefetch = false;
                         
                         // Get the actual max unpacked size from the file
                         uint64_t maxUnpackedSize = 0;
@@ -791,11 +864,51 @@ void ScanLineInputFile::Data::readPixels (
                             for (const auto& sci : chunkInfos) {
                                 size_t bufferPos = sci.leaderOffset - minLeaderOffset;
                                 
-                                // Parse leader: [y][packed_size] (each int32)
-                                int32_t* leader = reinterpret_cast<int32_t*>(g_scanlinePrefetchBuffer.data.data() + bufferPos);
-                                
-                                int32_t ldr_y = leader[0];
-                                int32_t packed_size = leader[1];
+                                // Parse leader:
+                                // - single-part: [y][packed_size]
+                                // - multi-part:  [part][y][packed_size]
+                                if (bufferPos + leaderSize > g_scanlinePrefetchBuffer.data.size())
+                                {
+                                    allChunks.clear();
+                                    usePrefetch = false;
+                                    break;
+                                }
+
+                                // Avoid unaligned int32_t access from byte buffer
+                                int32_t leaderVals[3] = {0, 0, 0};
+                                std::memcpy(
+                                    leaderVals,
+                                    g_scanlinePrefetchBuffer.data.data() + bufferPos,
+                                    leaderSize);
+
+                                int32_t ldr_part = -1;
+                                int32_t ldr_y = 0;
+                                int32_t packed_size = 0;
+                                if (isMultipart)
+                                {
+                                    ldr_part   = leaderVals[0];
+                                    ldr_y      = leaderVals[1];
+                                    packed_size = leaderVals[2];
+                                }
+                                else
+                                {
+                                    ldr_y      = leaderVals[0];
+                                    packed_size = leaderVals[1];
+                                }
+
+                                // Validate leader matches expected chunk
+                                if (isMultipart && ldr_part != partNumber)
+                                {
+                                    allChunks.clear();
+                                    usePrefetch = false;
+                                    break;
+                                }
+                                if (ldr_y != sci.startY)
+                                {
+                                    allChunks.clear();
+                                    usePrefetch = false;
+                                    break;
+                                }
                                 
                                 // Validate
                                 if (packed_size <= 0 || packed_size > (int32_t)(width * scansperchunk * 6)) {
@@ -821,15 +934,29 @@ void ScanLineInputFile::Data::readPixels (
                                 ci.level_x = 0;
                                 ci.level_y = 0;
                                 ci.packed_size = packed_size;
-                                // Compute unpacked_size based on actual chunk height
-                                // maxUnpackedSize is for a full chunk (scansperchunk lines)
-                                // Scale proportionally for partial chunks (edge case)
-                                if (chunkH == scansperchunk) {
+                                // Compute unpacked_size matching OpenEXRCore's compute_chunk_unpack_size:
+                                // - If any channel has line sampling OR this is a partial chunk,
+                                //   compute per-channel sampled sizes.
+                                // - Otherwise use part->unpacked_size_per_chunk (via maxUnpackedSize).
+                                if (hasSampling || chunkH != scansperchunk)
+                                {
+                                    uint64_t unpacksize = 0;
+                                    for (int c = 0; c < chlist->num_channels; ++c)
+                                    {
+                                        const exr_attr_chlist_entry_t* curc = (chlist->entries + c);
+                                        uint64_t chansz =
+                                            (uint64_t)((curc->pixel_type == EXR_PIXEL_HALF) ? 2 : 4);
+                                        chansz *= (uint64_t) openexr_compute_sampled_width(
+                                            width, curc->x_sampling, dw.min.x);
+                                        chansz *= (uint64_t) openexr_compute_sampled_height(
+                                            chunkH, curc->y_sampling, ldr_y);
+                                        unpacksize += chansz;
+                                    }
+                                    ci.unpacked_size = unpacksize;
+                                }
+                                else
+                                {
                                     ci.unpacked_size = maxUnpackedSize;
-                                } else if (scansperchunk > 0 && chunkH > 0) {
-                                    ci.unpacked_size = (maxUnpackedSize * (uint64_t)chunkH) / (uint64_t)scansperchunk;
-                                } else {
-                                    ci.unpacked_size = 0;
                                 }
                                 ci.data_offset = sci.leaderOffset + leaderSize;
                                 ci.sample_count_data_offset = 0;
@@ -1048,6 +1175,14 @@ void ScanLineProcess::run_decode (
         {
             throw IEX_NAMESPACE::IoExc ("Unable to choose decoder routines");
         }
+        default_read_fn = decoder.read_fn;
+    }
+    else if (default_read_fn)
+    {
+        // readPixels() may be called repeatedly and may or may not use IOMerge
+        // depending on the requested range. Restore the core-chosen read_fn
+        // before optionally overriding it for prefetch.
+        decoder.read_fn = default_read_fn;
     }
 
     // If prefetch buffer is active, use custom read function
@@ -1055,13 +1190,21 @@ void ScanLineProcess::run_decode (
     {
         if (decoder.decompress_fn != nullptr)
         {
-            // Compressed data: use prefetch read that sets packed_buffer
+            // Compressed: point packed_buffer into prefetch buffer (zero-copy)
             decoder.read_fn = &scanline_prefetched_read_chunk;
         }
         else
         {
-            // Uncompressed data: use direct read from prefetch buffer to output
-            decoder.read_fn = &scanline_prefetched_read_uncompressed_direct;
+            // Uncompressed:
+            // - If core selected the "read_uncompressed_direct" fast path
+            //   (unpack_and_convert_fn == NULL), we must copy directly into the
+            //   user buffers (and byte-swap as needed).
+            // - Otherwise, we must present the uncompressed bytes via packed_buffer
+            //   so the normal unpack/convert routines can run safely.
+            if (decoder.unpack_and_convert_fn == nullptr)
+                decoder.read_fn = &scanline_prefetched_read_uncompressed_direct;
+            else
+                decoder.read_fn = &scanline_prefetched_read_chunk;
         }
     }
 
